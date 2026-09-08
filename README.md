@@ -4,7 +4,7 @@
 經辦人在 LINE 用**自然語言**登記燈位，AI 解析後寫進 Google 試算表；查詢與大量修改直接用瀏覽器開試算表。
 
 - 程式碼：`light.gs`（單檔，無相依套件）
-- 測試：`test/light.test.js`（純 Node 跑的 stub 測試，不需 GAS 環境）→ `node test/light.test.js`，目前 109 項全過
+- 測試：`test/light.test.js`（純 Node 跑的 stub 測試，不需 GAS 環境）→ `node test/light.test.js`，目前 136 項全過
 
 ---
 
@@ -18,26 +18,29 @@ LINE 官方帳號（Messaging API Webhook）
       │ POST JSON
       ▼
 GAS Web 應用程式  doPost(e)
-      ├─ 1 指令分流：/help、/model（不打 AI）
+      ├─ 1 指令分流：/help、/model、聊天開關與 /角色（不打解析 AI）
       ├─ 2 回覆策略：未帶喚醒字／查詢／閒聊 → 沉默（連 AI 都不調，省配額）
+      │      ※ 例外：處於聊天模式（小幫手 聊天）時免喚醒字、每句都回
       ├─ 3 身分綁定：「我公司 亞盛燈業 我叫 李小華」→ 存腳本屬性 USER_IDENTS
-      ├─ 4 Gemini generateContent（模型序：手動鎖定 > 預設 > 自動探測，最多 6 個）
-      │      回傳 JSON：{ action, details{...} }
+      ├─ 4 askLLM() 依 LLM_PROVIDER 派送：GEMINI（多模型輪替容錯）或 OLLAMA（免費層）
+      │      登記解析回傳 JSON：{ action, details{...} }
       ├─ 5 必填攔截：缺欄 → 存 10 分鐘草稿 + 回覆「還需要什麼」與可照抄的格式
-      └─ 6 試算表寫入／修改（A~H 欄；跳過合計列）
+      ├─ 6 聊天模式下非寫入類問句 → chatAnswer()（角色＋操作手冊＋最近 5 輪，回覆上限 600 字）
+      └─ 7 試算表寫入／修改（A~H 欄；跳過合計列）
       │
       ▼
 Google 試算表「光明燈管理」分頁  ←→  瀏覽器直接編輯（查詢、小計公式都在這邊）
       │
       ▼
-sendLineReply() → 手機收到「新增成功／修改成功／需要補件」的回覆
+sendLineReply() → 超過 4800 字自動切成最多 5 則；非 200 明確丟錯
 ```
 
 | 元件 | 用途 | 備註 |
 |---|---|---|
 | LINE Messaging API | 收發訊息 | 只能拿到 `userId`；`displayName` 要另外呼叫 profile API |
 | Google Apps Script | Webhook 主機 + 業務邏輯 | 免伺服器，免費額度內 |
-| Gemini API | 中文語意 → JSON | `responseMimeType: application/json` |
+| Gemini API（預設） | 中文語意 → JSON | `responseMimeType: application/json`；模型依序試，最多 6 個 |
+| Ollama Cloud（可選） | 聊天／解析 | `LLM_PROVIDER=OLLAMA`；免費層 1 併發、依模型等級計量 |
 | Google 試算表 | 唯一資料來源 | 經辦人可用瀏覽器像 Excel 一樣直接編輯 |
 
 ---
@@ -126,13 +129,15 @@ SHEET_NAMES: {
 
 ## 3. 行為規格（LINE 端）
 
-處理順序（`decideFlow()` → AI → `shouldReplyFor()`）：
+處理順序（`decideFlow()` → `askLLM()` → `shouldReplyFor()`／`chatAnswer()`）：
 
 1. `/help`、`/model` → **一定回覆**
-2. 身分綁定句（整句只有關鍵字＋名稱）→ 記住並回覆，不動資料
-3. **沒帶喚醒字** → 完全沉默（不打 AI，省配額）。例外：該使用者有 10 分鐘內的補件草稿，或 `REPLY_MODE=ALL`
-4. 查詢語氣（`查一下/有哪些/幾盞/總共…` 且無寫入動詞）→ 沉默，請用瀏覽器看試算表
-5. 打 AI 後只有 `CREATE`／`UPDATE` 會回訊；`READ`／無法辨識 → 沉默並寫執行記錄
+2. 聊天指令（`聊天`、`結束聊天`、`角色`、`角色 xx`）→ 開關模式並回覆（見 4.6）
+3. 身分綁定句（整句只有關鍵字＋名稱）→ 記住並回覆，不動資料
+4. **沒帶喚醒字** → 完全沉默（不打 AI，省配額）。例外：处于聊天模式、有 10 分鐘內的補件草稿，或 `REPLY_MODE=ALL`
+5. 查詢語氣（`查一下/有哪些/幾盞/總共…` 且無寫入動詞）→ 沉默，請用瀏覽器看試算表（聊天模式中則改當問句回覆）
+6. 打 AI 後只有 `CREATE`／`UPDATE` 會回訊；`READ`／無法辨識 → 沉默並寫執行記錄（聊天模式下這一步會轉成對話回覆）
+7. 送出一律經 `prepareLineMessages()`：單則 4800 字、最多 5 則；聊天回覆另受 `CHAT_MAX_CHARS`（預設 600 字）限制
 
 ### 3.1 必填與補件
 `REQUIRED_FIELDS = 業務、廟宇、規格、總燈數`。缺任何一項**完全不上表**，回覆：
@@ -210,32 +215,50 @@ SHEET_NAMES: {
 1. <https://script.google.com> → 新的專案 → 把 `light.gs` 整份貼上並儲存
 2. 專案設定（⚙️）→ **Script Properties** → 新增：
 
-| 屬性 | 值 | 必要性 |
-|---|---|---|
-| `LINE_ACCESS_TOKEN` | 4.1 的 long-lived token | 必要 |
-| `GEMINI_API_KEY` | Google AI Studio 的金鑰 | 必要 |
-| `SPREADSHEET_ID` | 試算表網址 `/d/` 與 `/edit` 之間那串 | 建議必填，詳見 4.3 |
-| `GEMINI_MODEL` | 例 `gemini-3.1-flash-lite` | 選填，等同 `/model xxx` |
-| `WAKE_WORDS` | 例 `小幫手,助理` | 選填 |
-| `SHEET_NAME` | 主表分頁名稱，預設 `光明燈管理` | 選填（分頁由 `setupLightSheet()` 自動建立） |
-| `DEFAULT_AGENT` | 沒寫業務、也沒綁定時的預設承攬商，預設 `聖文`；設空白＝改用綁定／LINE 暱稱，都沒有就回問 | 選填 |
-| `REPLY_MODE` | `ALL` 時查詢與閒聊也會回訊 | 選填 |
-| `DATE_TAG_IN_REMARK` | 設 `OFF` 就不把〔國…〕標記寫進備註欄 | 選填 |
-| `AGENT_FROM_LINE_PROFILE` | `ON` 時未填業務自動帶 LINE 暱稱 | 選填 |
+所有可調參數都集中在 `light.gs` 第 1 節的 `CONFIG`，規則是統一的**「腳本屬性有值就用，沒值用程式內預設」**。
+GAS 每次執行都會重跑一次全域初始化，所以改腳本屬性不用改碼、也不用重新部署，下一則訊息就生效。
 
-3. 分頁名稱改成 `光明燈管理`，並把 A 欄拆成「業務／廟宇」兩欄（原有資料整欄右移），合計公式挪到 I 欄以後
-4. 選單函式選 `setupLightHeader` → 執行（首次會要求授權 Google 帳戶，同意 Sheets 權限）→ 表頭 A1:H1 完成
-5. 可先跑 `testLineToken()`、`testGeminiProbe()` 確認兩條金鑰都通（看「執行記錄」）
+| 腳本屬性 | 值／預設 | 必要性 |
+|---|---|---|
+| `LINE_ACCESS_TOKEN` | LINE channel access token（long-lived） | **必要** |
+| `GEMINI_API_KEY` | Google AI Studio 金鑰 | **必要**（預設解析走 Gemini） |
+| `SPREADSHEET_ID` | 試算表網址 `/d/` 與 `/edit` 之間那串 | **建議必填**，詳見 4.3 |
+| `OLLAMA_API_KEY` | 在 ollama.com/settings/keys 產生 | 只有要用 Ollama 才需要 |
+| `LLM_PROVIDER` | `GEMINI`（預設）或 `OLLAMA`：登記解析用哪家 | 選填 |
+| `CHAT_PROVIDER` | 留空＝跟 `LLM_PROVIDER`；例 `OLLAMA`＝只有聊天走 Ollama | 選填 |
+| `OLLAMA_MODEL` | 預設 `gpt-oss:20b`（免費層建議 level 1~2 輕量模型） | 選填 |
+| `OLLAMA_BASE_URL` | 預設 `https://ollama.com` | 選填 |
+| `GEMINI_MODEL` | 例 `gemini-3.1-flash-lite`，等同 `/model xxx` | 選填 |
+| `SHEET_NAME` | 主表分頁名，預設 `光明燈管理` | 選填 |
+| `WAKE_WORDS` | 預設 `小幫手,小帮,幫手,助理`（逗號分隔） | 選填 |
+| `DEFAULT_AGENT` | 預設 `聖文`；設空白＝沒寫業務又沒綁定时回問 | 選填 |
+| `REPLY_MODE` | `ALL`＝查詢與無關訊息也回訊（等於解除沉默） | 選填 |
+| `DATE_TAG_IN_REMARK` | `OFF`＝不把〔國…〕標記寫進備註欄 | 選填 |
+| `AGENT_FROM_LINE_PROFILE` | `ON`＝未填業務時自動帶 LINE 暱稱（預設 OFF） | 選填 |
+| `CHAT_DEFAULT_ROLE` | 預設 `操作說明` | 選填 |
+| `CHAT_MANUAL_SHEET` | 手冊分頁名，預設 `操作手冊` | 選填 |
+| `CHAT_MANUAL_DOC_ID` | Google 文件 ID（會多要求 Docs 授權），設了優先於分頁 | 選填 |
+| `CHAT_MANUAL_MAX_CHARS` | 手冊進 prompt 的上限，預設 `4000` 字 | 選填 |
+| `CHAT_MAX_CHARS` | 聊天回覆字數上限，預設 `600` 字（含標點） | 選填 |
+| `CHAT_MODE_TTL` | 聊天模式無操作多久自動關，預設 `3600` 秒 | 選填 |
+| `DRAFT_TTL` / `MAX_LIST_ROWS` | 補件草稿秒數 `600`／列表筆數 `12` | 選填 |
+
+> **金鑰只放腳本屬性，絕不寫進 `light.gs`**（這檔已在 GitHub 上）。`CONFIG` 裡出現的 `YOUR_...` 都是佔位字，沒填時相關函式會直接報錯並說明去哪設。
+
+3. 分頁**不用自己建**：函式選單選 `setupLightSheet` → 執行（首次會要求授權 Google 帳戶，同意 Sheets 權限）
+   → 自動建立主表（A~H 表頭、凍結首列）＋同步 `CONFIG.SHEET_NAMES` 裡列到的公司唯讀投影分頁；已存在只更新表頭與投影公式，**不會清掉主表資料**
+4. 既有資料搬進來：A 欄拆成「業務／廟宇」兩欄（整欄右移），合計／小計公式挪到 **I 欄以後**
+5. 跑 `testLineToken()`、`testGeminiProbe()` 確認 LINE 與 Gemini 兩條金鑰都通；有設 Ollama 再跑 `testLLMProviders()`，執行記錄會印每家連線結果與延遲 ms
 
 ### 4.3 試算表 ID 與權限（資料究竟落在哪一張表）
 
-`CONFIG.SPREADSHEET_ID`（light.gs:7）依下面三個順序解析，第一筆拿到就用它：
+`CONFIG.SPREADSHEET_ID` 依下面三個順序解析，第一筆拿到就用它：
 
 | 順序 | 來源 | 適用情境 |
 |---|---|---|
 | 1 | 腳本屬性 `SPREADSHEET_ID` | 獨立 GAS 專案（本文件走这条路）。**建議一律用它**，最明確也好搬表 |
 | 2 | `SpreadsheetApp.getActiveSpreadsheet().getId()` | 用「試算表 → 扩展程序 → Apps Script」建立的**綁定型腳本**，會自動拿到它所在的那張表 |
-| 3 | 硬編 fallback ID `1Kq6Du15…TH9A` | 前兩者都拿不到時的防呆。**換表時最容易忘記改，建議確認 1 或 2 生效後刪掉這段** |
+| 3 | 佔位值 `YOUR_SPREADSHEET_ID` | 前兩者都拿不到時會停在佔位值，`getSpreadsheet()` 直接報「尚未設定 SPREADSHEET_ID」，不會誤寫到別人的表 |
 
 ID 怎麼看：試算表網址 `https://docs.google.com/spreadsheets/d/←這一串→/edit`
 
@@ -268,6 +291,43 @@ ID 怎麼看：試算表網址 `https://docs.google.com/spreadsheets/d/←這一
 
 ---
 
+### 4.6 聊天模式（`小幫手 聊天`）
+
+開關式設計，不是常駐：進入後每則訊息都回，結束後恢復「只回會動到資料的訊息」。
+
+| 指令 | 作用 |
+|---|---|
+| `小幫手 聊天`（或 `/chat`） | 進入聊天模式（之後**免喚醒字**，每句都回） |
+| `小幫手 結束聊天`（或 `/chat off`） | 離開，並清空對話記憶 |
+| `小幫手 角色` | 列出可用角色與目前角色 |
+| `小幫手 角色 文案助手` | 換角色（順帶開啟聊天模式） |
+| 60 分鐘沒動 | 自動關閉（`CHAT_MODE_TTL`），不會有人忘了關導致每句都被回 |
+
+內建四種角色（`CONFIG.CHAT.ROLES`，要加就在那裡加）：`操作說明`（預設，照操作手冊回答）、`禮俗顧問`、`文案助手`、`通用助理`。
+
+- **登記優先**：聊天模式下傳登記句（含廟名／盞數／規格等特徵）仍走原本入表流程，不會被當成聊天
+- **上下文**：記最近 5 輪（`CHAT_HISTORY_TURNS`），放 CacheService，10 分鐘沒聊就清空
+- **操作手冊來源**（自動偵測，第一個有值的生效）：① `CHAT_MANUAL_DOC_ID` 的 Google 文件（你自己從網站產好貼進去最方便，但會多要求 Docs 授權）② 同一份試算表的 `操作手冊` 分頁（A 主題／關鍵字、B 內容、C 範例句，一題一列；`合計` 開頭會跳過）③ 都沒有 → 退回 `/help` 内建文案
+- 每則提問只把**最相關的 5 條**送進 prompt（完全沒命中才給前 3 條），並受 `CHAT_MANUAL_MAX_CHARS` 截斷，不會每句話都燒整本手冊
+- **字數限制**：`CHAT_MAX_CHARS`（預設 600 字含標點）同時做兩件事 —— 寫進 system prompt 要求模型遵守，以及**送出前程式再硬截一道**（模型常不聽），截斷時結尾標 `…（已限制 600 字，要更詳細請再問一句）`
+
+### 4.7 模型供應者與 LINE 回訊上限
+
+**供應者**：`LLM_PROVIDER`／`CHAT_PROVIDER` 可填 `GEMINI`（免錢預設，含多模型輪替容錯）或 `OLLAMA`（免費額度：1 個併發、依模型等級計量、session 每 5 小時與每週各一次重置，只開放輕量 starter 模型）。
+要點：登記解析建議留 GEMINI（固定格式、省額度），聊天可單獨指 `CHAT_PROVIDER=OLLAMA`；Ollama 若回出不能解析的 JSON，會明確提示「把解析退回 GEMINI」。本機跑的 Ollama GAS 打不到（需要公網 https），不建議。
+
+**LINE 官方上限**（不是沒有限制）：
+
+| 限制 | 值 | 本系統處理方式 |
+|---|---|---|
+| 單則 text 訊息 | **5000 字元** | `LINE_TEXT_LIMIT = 4800`，留 200 字安全餘量 |
+| 一次 reply 的 message objects | **最多 5 則** | `prepareLineMessages()` 依換行切則（切點太爛就硬切）；超過 5 則則省略其餘，末則標「內容過長，已省略 N 字」 |
+| 被 LINE 拒絕 | HTTP 4xx | 以前只 log（使用者只看到「沒回訊」），現在**丟錯誤**並進異常回覆與執行記錄 |
+
+所以長查詢、長手冊回答、聊天長答都會被安全切成 1~5 則，不會再靜靜失敗。
+
+---
+
 ## 5. 給 AI 的契約（prompt 規格）
 
 `analyzeMessageWithGemini()` 送出的 JSON 固定為：
@@ -295,8 +355,12 @@ prompt 內的四條硬規則（要加欄位時一起改）：
 | 訊息完全沒回 | 沒帶喚醒字、或那是查詢句（設計如此） | 執行記錄會印 `🔇 不回覆（…）`；要全部回覆就設 `REPLY_MODE=ALL` |
 | LINE Verify 失敗 | 沒發新版本、網址少 `/exec`、權限不是「任何人」 | 重走 4.4 |
 | `找不到分頁「光明燈管理」` | 分頁還沒建立或名稱不對 | GAS 執行一次 `setupLightSheet()`（會自動建分頁），或用腳本屬性 `SHEET_NAME` 指定現有分頁名 |
+| 用 Ollama 报 429／很慢 | 免費層只 1 個併發，兩人同時發言會排隊或被拒 | `LLM_PROVIDER` 設回 `GEMINI`，或只 `CHAT_PROVIDER=OLLAMA` |
+| 一直回訊、變得很吵 | 有人開了聊天模式忘記關 | 叫他傳 `結束聊天`；或調低 `CHAT_MODE_TTL` |
+| 回覆被截斷 | `CHAT_MAX_CHARS` 預設 600 字 | 提高該屬性，或請對方再問「詳細一點」 |
+| 報「尚未設定 SPREADSHEET_ID」 | 腳本屬性沒設且非綁定型腳本 | 補 `SPREADSHEET_ID` |
 | 只有「系統異常」 | 試算表分頁名不對、`SPREADSHEET_ID` 錯、該表不在你帳號下 | 看執行記錄堆疊；`找不到名為「光明燈管理」的工作表分頁` = ID 對但分頁名錯；`openById` 權限錯誤 = 表不屬於你 |
-| 登記寫到舊表 | 拿到的是 light.gs:7 的 fallback ID（腳本屬性沒設、又不是綁定型腳本） | 設 `SPREADSHEET_ID` 或把 fallback 那段刪掉 |
+| 报「尚未設定 SPREADSHEET_ID」 | 腳本屬性沒設，且腳本不是綁定型（拿不到 active spreadsheet） | 在腳本屬性補 `SPREADSHEET_ID` |
 | `AI 免費配額暫時用盡` | Gemini 免費層限流 | `小幫手` 不用管，稍後重試；或 `/model gemini-3.1-flash-lite` |
 | 業務欄變成綽號 | 開了 `AGENT_FROM_LINE_PROFILE` | 傳 `我公司 ○○` 綁定，或關掉該屬性 |
 | 新增後小計沒變 | 新增列落在小計**下方** | 合計改整欄 `=SUM(D:D)`，或把小計移到 I 欄以後 |
@@ -310,7 +374,7 @@ prompt 內的四條硬規則（要加欄位時一起改）：
 ```bash
 node test/light.test.js
 ```
-用 Node 的 `vm` 载入 `light.gs`，把 `SpreadsheetApp`／`UrlFetchApp`／`CacheService` 等 GAS 服務换成 stub，並塞入真實格式的 17 列種子資料（含合計列、右側公式欄）。涵蓋（共 109 項）：
+用 Node 的 `vm` 载入 `light.gs`，把 `SpreadsheetApp`／`UrlFetchApp`／`CacheService` 等 GAS 服務换成 stub，並塞入真實格式的 17 列種子資料（含合計列、右側公式欄）。涵蓋（共 136 項）：
 
 - 日期正規化（國曆／民國／農曆不換算）十餘種寫法
 - 備註欄：明示才寫、可單獨修改、查詢會列出；〔國…〕標記的插入／替換／不堆疊、可關掉
@@ -324,6 +388,10 @@ node test/light.test.js
 - 分頁自動建立 `setupLightSheet()`、`SPREADSHEET_ID` 佔位值防護
 - 公司分頁只產 QUERY 投影、不為其他家亂開分頁、拿掉 `SHEET_NAMES` 兩行可整組停用
 - 身分綁定各種寫法、批次改名 `renameAgent()` 預覽與實作
+- LLM 供應者路由（GEMINI/OLLAMA、缺 key 明確報錯、`wantJson` 的 format 參數與壞 JSON 退路）
+- 聊天模式：指令辨識、進入／結束／逾時自動關、角色清單與切換、5 輪記憶、聊天中登記優先
+- 回覆字數上限（`chatCharLimit()`／`clipChatReply()`）與 LINE 切則（4800 字、最多 5 則）、非 200 丟錯
+- 操作手冊三來源（文件 → 分頁 → `/help`）與「只挑相關條目」
 
 改動 `light.gs` 後請先跑这支再部署。
 
@@ -342,15 +410,17 @@ node test/light.test.js
 
 | 區塊 | 內容 | 要改行為時看這裡 |
 |---|---|---|
-| `1. 設定區` | `CONFIG`：金鑰、分頁名、`COLUMNS`、`HEADERS`、`WAKE_WORDS`、`REQUIRED_FIELDS`、`FIELD_LABELS`、`DRAFT_TTL` | 欄位順序、必填、喚醒字 |
+| `1. 設定區` | `sp()/spInt()/spList()/spOn()` ＋ `CONFIG`：金鑰、分頁名、`COLUMNS`、`HEADERS`、`WAKE_WORDS`、`REQUIRED_FIELDS`、`FIELD_LABELS`、`LLM`、`CHAT`（角色／字數上限／手冊來源）| 欄位順序、必填、喚醒字 |
 | `2. Webhook 接收端` | `doPost()`：分流順序 = 指令 → 身分綁定 → AI → 必填攔截 → 寫入 → 回訊；`doGet()` 是瀏覽器狀態頁 | 加新指令、改處理順序 |
 | `2.3 喚醒字與補件草稿` | `stripWakeWord()`、`loadDraft/saveDraft/clearDraft`、`mergeDetails()`、`missingRequired()`、`askMissingMessage()` | 改補件話術與 TTL |
 | `2.35 身分綁定` | `parseIdentityCommand()`、`bindIdentity()`、`identityLabel()`、`getUserIdentity()`、`fetchLineDisplayName()` | 加新綁定写法、公司/人員邏輯 |
 | `2.4 回覆策略` | `decideFlow()`、`shouldReplyFor()`、`isReadOnlyAsking()`、`looksLikeLightData()`、`isReplyAllMode()` | 調整「何時該回訊」 |
 | `2.5 / 2.6 指令` | `handleModelCommand()`、`getCandidateModels()`、`handleHelpCommand()` | 改 `/model`、`/help` 文案 |
-| `3. Gemini 串接` | `analyzeMessageWithGemini()`：prompt 契約、多模型容錯 | **加欄位時必改 prompt** |
+| `3. Gemini 串接` | `analyzeMessageWithGemini()`：登記 prompt 契約 | **加欄位時必改 prompt** |
+| `3.5 LLM 傳輸層` | `askLLM()`、`askGemini()`（多模型容錯）、`askOllama()`、`providerFor()`、`testLLMProviders()` | 換／加供應者 |
+| `3.6 聊天模式` | `setChatState/getChatState`、`parseChatCommand/handleChatCommand`、`chatAnswer`、`manualItems/pickManual`、`chatCharLimit/clipChatReply` | 改角色、手冊、字數 |
 | `4. 核心業務` | `handleDataRouting()` 分流；`doCreate/doUpdate/doRead`；`readData()` 裁寬、`isSummaryRow()`、`matchTemple/matchSpec/normSpec`、`parseDateKey()`、`buildRowValues()`、`renameAgent()`、`setupLightHeader()` | 比對規則與寫入規則 |
-| `5. LINE 工具` | `sendLineReply()` | 改訊息格式/加 Flex Message |
+| `5./5.5 LINE 工具` | `sendLineReply()`、`prepareLineMessages()`、`splitLineText()` | 訊息格式、切則與上限 |
 | `5./6. 其他` | `sendLineReply()`、瀏覽器狀態頁 `doGet()`、排錯筆 `testGeminiProbe()`／`testLineToken()` | 排錯用 |
 
 ---

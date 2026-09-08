@@ -70,7 +70,7 @@ function makeSS(masterName, masterRows) {
 }
 
 let ssStub, sheet;
-let cacheStore = {}, sent = [];
+let cacheStore = {}, sent = [], ollamaCalls = [], geminiCalls = [];
 function load() {
   ssStub = makeSS('光明燈管理', SEED);
   sheet = ssStub.master;
@@ -90,11 +90,22 @@ function load() {
       remove: k => { delete cacheStore[k]; }
     }) },
     UrlFetchApp: { fetch: (url, opt) => {
-      if (String(url).indexOf('/v2/bot/profile/') !== -1) {
-        return { getResponseCode: () => (ctx.PROFILE_NAME ? 200 : 404), getContentText: () => JSON.stringify({ displayName: ctx.PROFILE_NAME || '' }) };
+      const u = String(url);
+      const ok = body => ({ getResponseCode: () => (ctx.HTTP_CODE || 200), getContentText: () => (typeof body === 'string' ? body : JSON.stringify(body)) });
+      if (u.indexOf('/v2/bot/profile/') !== -1) return ok({ displayName: ctx.PROFILE_NAME || '' });
+      if (u.indexOf('/v2/bot/message/reply') !== -1) {
+        JSON.parse(opt.payload).messages.forEach(m => sent.push(m.text));
+        return ok({});
       }
-      sent.push(JSON.parse(opt.payload).messages[0].text);
-      return { getResponseCode: () => 200, getContentText: () => '{}' };
+      if (u.indexOf('/api/chat') !== -1) {
+        ollamaCalls.push(JSON.parse(opt.payload));
+        return ok({ message: { content: ctx.OLLAMA_REPLY || 'OK 從 Ollama 來的回覆' } });
+      }
+      if (u.indexOf('generativelanguage') !== -1) {
+        geminiCalls.push(u);
+        return ok({ candidates: [{ content: { parts: [{ text: ctx.GEMINI_TEXT || JSON.stringify({ action: 'READ', details: {} }) }] } }] });
+      }
+      return ok('{}');
     } },
     HtmlService: { createHtmlOutput: x => ({ content: x }) },
     Logger: { log() {} }, console
@@ -113,8 +124,13 @@ function reset() {
   sheet._rows = SEED.map(r => r.slice()); sheet._wrote = 0;
   sheet._formulas = {}; sheet._cleared = 0; sheet._protected = false;
   run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false; CONFIG.SPREADSHEET_ID = "FAKE";');
-  cacheStore = {}; sent = [];
-  ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS; run('CONFIG.AGENT_FROM_LINE_PROFILE = false');
+  cacheStore = {}; sent = []; ollamaCalls = []; geminiCalls = [];
+  ctx.OLLAMA_REPLY = ''; ctx.GEMINI_TEXT = ''; ctx.HTTP_CODE = 200; delete ctx.__props.OLLAMA_API_KEY;
+  ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS;
+  run('CONFIG.REPLY_MODE = ""; CONFIG.OLLAMA_API_KEY = "YOUR_OLLAMA_API_KEY";');
+  run('CONFIG.LLM.PROVIDER = "GEMINI"; CONFIG.LLM.CHAT_PROVIDER = ""; CONFIG.LLM.OLLAMA_MODEL = "gpt-oss:20b";');
+  run('CONFIG.LLM.OLLAMA_BASE_URL = "https://ollama.com"; CONFIG.CHAT.MAX_REPLY_CHARS = 600;');
+  run('CONFIG.CHAT.MANUAL_DOC_ID = ""; CONFIG.CHAT.MANUAL_SHEET = "操作手冊";'); run('CONFIG.AGENT_FROM_LINE_PROFILE = false');
   ctx.__NEXT_AI = null; ctx.PROFILE_NAME = '';
 }
 function t(name, fn) {
@@ -340,12 +356,12 @@ t('意圖把關：CREATE/UPDATE 才回', () => {
   assert.strictEqual(run('shouldReplyFor("")'), false);
 });
 t('REPLY_MODE=ALL 可全部回覆', () => {
-  ctx.__props.REPLY_MODE = 'ALL';
+  run('CONFIG.REPLY_MODE = "ALL"');
   assert.strictEqual(flow('查一下 天成宮 有哪些燈'), 'ai');
   assert.strictEqual(run('shouldReplyFor("READ")'), true);
 });
 t('REPLY_MODE=off 不影響（非 ALL 值）', () => {
-  ctx.__props.REPLY_MODE = 'WRITE';
+  run('CONFIG.REPLY_MODE = "WRITE"');
   assert.strictEqual(flow('查一下 天成宮 有哪些燈'), 'silent');
   assert.strictEqual(run('shouldReplyFor("READ")'), false);
 });
@@ -481,7 +497,7 @@ t('綁定後改公司名 -> 直接蓋掉舊名', () => {
   assert.strictEqual(run('JSON.parse(__props.USER_IDENTS).U_TEST.company'), '亞盛燈業');
 });
 t('REPLY_MODE=ALL 時不用喚醒字也處理', () => {
-  ctx.__props.REPLY_MODE = 'ALL';
+  run('CONFIG.REPLY_MODE = "ALL"');
   ai({ action: 'READ', details: D({ temple: '天成宮' }) });
   post('查一下 天成宮 有哪些燈');
   assert.ok(/查詢結果/.test(sent[0]), sent[0]);
@@ -700,6 +716,206 @@ t('強制新增可以繞過一切比對', () => {
 t('合計列不會被當成同廟', () => {
   const r = create(D2({ agent: '聖文', temple: '合計燈數', spec: '4*5 OLED', total_count: 1 }));
   assert.ok(/新廟名/.test(r), r);
+});
+
+console.log('\n【LINE 送出層：5000 字上限與多則切分】');
+t('短訊不變長、不切則', () => {
+  const n = run(`prepareLineMessages("hello").length`);
+  assert.strictEqual(n, 1);
+});
+t('超長內容依換行切則', () => {
+  const big = Array.from({ length: 300 }, (_, i) => `第${i}行 光明燈登記說明 5*7 OLED琥珀色 2112盞 國10/17前`).join('\n');
+  const chunks = JSON.parse(run(`JSON.stringify(prepareLineMessages(${JSON.stringify(big)}))`));
+  assert.ok(chunks.length >= 2, '應切成多則：' + chunks.length);
+  chunks.forEach(c => assert.ok(c.length <= 4800, '單則不超 4800：' + c.length));
+});
+t('切點太爛時硬切，且不超過上限', () => {
+  const one = '甲'.repeat(9000);
+  const chunks = JSON.parse(run(`JSON.stringify(splitLineText(${JSON.stringify(one)}, 4800))`));
+  assert.strictEqual(chunks.length, 2);
+  assert.strictEqual(chunks[0].length, 4800);
+});
+t('超過 5 則會省略並在末則說明', () => {
+  const huge = Array.from({ length: 20 }, () => '乙'.repeat(4700) + '\n').join('');
+  const chunks = JSON.parse(run(`JSON.stringify(prepareLineMessages(${JSON.stringify(huge)}))`));
+  assert.strictEqual(chunks.length, 5, '最多 5 則');
+  assert.ok(/內容過長，已省略/.test(chunks[4]), chunks[4].slice(-90));
+});
+t('LINE 非 200 時明確拋錯（不再靜靜不回訊）', () => {
+  ctx.HTTP_CODE = 400;
+  assert.throws(() => run(`sendLineReply("RT", "x")`), /LINE 送出失敗 HTTP 400/);
+});
+
+console.log('\n【聊天回覆字數上限】');
+t('預設 600 字', () => assert.strictEqual(run('chatCharLimit()'), 600));
+t('腳本屬性 CHAT_MAX_CHARS 可覆蓋，且夾在 80~2000', () => {
+  run('CONFIG.CHAT.MAX_REPLY_CHARS = 300');
+  assert.strictEqual(run('chatCharLimit()'), 300);
+  run('CONFIG.CHAT.MAX_REPLY_CHARS = 5');
+  assert.strictEqual(run('chatCharLimit()'), 80);
+  run('CONFIG.CHAT.MAX_REPLY_CHARS = 99999');
+  assert.strictEqual(run('chatCharLimit()'), 2000);
+});
+t('模型超長時程式再硬截一道', () => {
+  run('CONFIG.CHAT.MAX_REPLY_CHARS = 120');
+  const long = Array.from({ length: 20 }, (_, i) => `說明第${i}行，內容有點長用來測試截斷行為。`).join('\n');
+  const clipped = run(`clipChatReply(${JSON.stringify(long)})`);
+  assert.ok(clipped.length <= 200, '截斷後仍過長：' + clipped.length);
+  assert.ok(/已限制 120 字/.test(clipped), clipped.slice(-60));
+  assert.ok(!clipped.includes('說明第19行'), '尾段應被去掉');
+});
+t('空回覆不會回傳空字串', () => assert.strictEqual(run(`clipChatReply("   ")`), '（沒什麼回應，再問一次看看）'));
+t('system prompt 裡寫明字數上限', () => assert.ok(/字以內（含標點）/.test(run(`chatSystemPrompt('操作說明','怎麼登記')`))));
+
+console.log('\n【LLM 供應者路由（GEMINI / OLLAMA）】');
+t('預設走 Gemini，不打 Ollama', () => {
+  run(`askLLM({ system:'s', user:'u', wantJson:false, purpose:'chat' })`);
+  assert.strictEqual(ollamaCalls.length, 0);
+  assert.ok(geminiCalls.length >= 1, 'Gemini 應被呼叫');
+});
+t('CHAT_PROVIDER=OLLAMA 只讓聊天走 Ollama，解析仍 Gemini', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "test-key"');
+  run(`askLLM({ system:'s', user:'你好', wantJson:false, purpose:'chat' })`);
+  assert.strictEqual(ollamaCalls.length, 1, '聊天應打 Ollama');
+  assert.strictEqual(ollamaCalls[0].model, 'gpt-oss:20b', '用預設模型名');
+  run(`askLLM({ user:'登記 石岡子乾元宮 5*7 2112盞', wantJson:true, purpose:'parse' })`);
+  assert.strictEqual(ollamaCalls.length, 1, '解析不應打 Ollama');
+  assert.ok(geminiCalls.length >= 2, '解析仍走 Gemini');
+});
+t('Ollama 请求格式：messages 帶 system/history、stream=false', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "test-key"');
+  run('CONFIG.LLM.OLLAMA_MODEL = "llama3.2:3b"');
+  const r = run(`askLLM({ system:'你是小幫手', user:'怎麼改燈數', history:[{role:'user',text:'前一句'}], wantJson:false, purpose:'chat' })`);
+  const body = ollamaCalls[ollamaCalls.length - 1];
+  assert.strictEqual(body.model, 'llama3.2:3b');
+  assert.strictEqual(body.stream, false);
+  assert.strictEqual(body.messages[0].role, 'system');
+  assert.strictEqual(body.messages[1].content, '前一句');
+  assert.strictEqual(body.messages[2].content, '怎麼改燈數');
+  assert.strictEqual(r, 'OK 從 Ollama 來的回覆');
+});
+t('要 Ollama 但沒設 key -> 明確告訴去哪設', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  assert.throws(() => run(`askLLM({ system:'s', user:'u', purpose:'chat' })`), /OLLAMA_API_KEY/);
+});
+t('wantJson 時 Ollama 加 format=json 並解析', () => {
+  run('CONFIG.LLM.PROVIDER = "OLLAMA"; CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "k"');
+  ctx.OLLAMA_REPLY = '```json\n{"action":"READ","details":{}}\n```';
+  const j = run(`askLLM({ system:'s', user:'u', wantJson:true, purpose:'parse' })`);
+  assert.strictEqual(ollamaCalls[ollamaCalls.length - 1].format, 'json');
+  assert.strictEqual(j.action, 'READ');
+});
+t('LLM_PROVIDER=OLLAMA 但回出爛 JSON -> 建議退回 GEMINI 的錯誤訊息', () => {
+  run('CONFIG.LLM.PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "k"');
+  ctx.OLLAMA_REPLY = '我不知道你在說什麼';
+  assert.throws(() => run(`askLLM({ system:'s', user:'u', wantJson:true, purpose:'parse' })`), /建議把解析改回 GEMINI/);
+  run('CONFIG.LLM.PROVIDER = "GEMINI"');
+});
+
+console.log('\n【聊天模式指令與流程】');
+t('聊天指令辨識', () => {
+  assert.strictEqual(run(`parseChatCommand("聊天").action`), 'on');
+  assert.strictEqual(run(`parseChatCommand("/chat").action`), 'on');
+  assert.strictEqual(run(`parseChatCommand("小幫手 聊天".replace("小幫手 ","")).action`), 'on');
+  assert.strictEqual(run(`parseChatCommand("結束聊天").action`), 'off');
+  assert.strictEqual(run(`parseChatCommand("/chat off").action`), 'off');
+  assert.strictEqual(run(`parseChatCommand("角色").action`), 'roles');
+  assert.strictEqual(run(`parseChatCommand("角色 文案助手").role`), '文案助手');
+  assert.strictEqual(run(`parseChatCommand("登記 石岡子乾元宮 5*7 2112盞")`), null, '登記句不應被當成聊天指令');
+});
+t('進入/結束聊天狀態與過期自動關', () => {
+  run(`setChatState("U_C1", true)`);
+  assert.ok(run(`!!getChatState("U_C1")`), '應該在聊天中');
+  assert.ok(run(`handleChatCommand("U_C1", {action:'off'})`).indexOf('已結束聊天') !== -1);
+  assert.strictEqual(run(`getChatState("U_C1")`), null);
+  run(`setChatState("U_C2", true)`);
+  run(`(function(){ var m=${'{}'}; var s=readChatStates(); s.U_C2.at = Date.now() - (CONFIG.CHAT.MODE_TTL*1000 + 5000); })()`);
+  run(`(function(){ var m=readChatStates(); m.U_C2.at = Date.now() - (CONFIG.CHAT.MODE_TTL*1000 + 5000); writeChatStates(m); })()`);
+  assert.strictEqual(run(`getChatState("U_C2")`), null, '超過 60 分鐘沒動作應自動關閉');
+});
+t('角色清單與切換、不存在的角色', () => {
+  const list = run(`handleChatCommand("U_C3", {action:'roles'})`);
+  assert.ok(/操作說明 ← 使用中/.test(list), list);
+  assert.ok(/禮俗顧問|文案助手/.test(list), list);
+  assert.ok(/已切換角色：文案助手/.test(run(`handleChatCommand("U_C3", {action:'role', role:'文案助手'})`)));
+  assert.ok(/沒有這個角色/.test(run(`handleChatCommand("U_C3", {action:'role', role:'外星人'})`)));
+});
+t('聊天模式下：未帶喚醒字的問句也會被處理', () => {
+  run(`setChatState("U_TEST", true)`);
+  assert.strictEqual(run(`decideFlow("送燈時間要怎麼寫？", false, !!getChatState("U_TEST")).mode`), 'ai');
+  run(`setChatState("U_TEST", false)`);
+  assert.strictEqual(run(`decideFlow("送燈時間要怎麼寫？", false, false).mode`), 'silent');
+});
+t('聊天模式 e2e：純問句直接聊，回覆帶角色前綴與字數限制', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "k"');
+  ctx.OLLAMA_REPLY = '登记时把庙名、规格、盏数写在「小幫手」后面即可。';
+  run(`setChatState("U_TEST", true)`);
+  post('那要怎麼打？');
+  assert.ok(/^💬【操作說明】/.test(sent[0]), sent[0]);
+  assert.ok(/登记时把庙名/.test(sent[0]), sent[0]);
+  assert.strictEqual(ollamaCalls.length, 1, '只該打 Ollama 一次');
+});
+t('聊天模式中傳登記句 -> 仍優先入表（不被當成聊天）', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "k"');
+  run(`setChatState("U_TEST", true)`);
+  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '永照宮', spec: '5*7 OLED', total_count: 66 }) });
+  const before = sheet._rows.length;
+  post('小幫手 登記 永照宮 5*7 OLED 66盞');
+  assert.strictEqual(sheet._rows.length, before + 1, '應寫入主表');
+  assert.ok(/新增成功/.test(sent[0]), sent[0]);
+});
+t('對話記憶只留最近 5 輪', () => {
+  for (let i = 1; i <= 9; i++) run(`pushHistory("U_H", "問${i}", "答${i}")`);
+  const h = JSON.parse(run(`JSON.stringify(loadHistory("U_H"))`));
+  assert.strictEqual(h.length, 10, '5 輪 = 10 則');
+  assert.strictEqual(h[0].text, '問5');
+  assert.strictEqual(h[9].text, '答9');
+});
+t('下一句聊天會帶著前幾輪歷史送出去', () => {
+  run('CONFIG.LLM.CHAT_PROVIDER = "OLLAMA"');
+  run('CONFIG.OLLAMA_API_KEY = "k"');
+  run(`setChatState("U_TEST2", true)`);
+  ctx.OLLAMA_REPLY = '第一答';
+  run(`chatAnswer("U_TEST2", "第一問")`);
+  ctx.OLLAMA_REPLY = '第二答';
+  run(`chatAnswer("U_TEST2", "第二問")`);
+  const body = ollamaCalls[ollamaCalls.length - 1];
+  const flat = JSON.stringify(body.messages);
+  assert.ok(flat.indexOf('第一問') !== -1 && flat.indexOf('第一答') !== -1, '應帶上下文：' + flat.slice(0, 300));
+});
+
+console.log('\n【操作手冊來源自動偵測】');
+t('沒文件沒分頁 -> 退回 /help 內建文案', () => {
+  const m = run(`chatSystemPrompt('操作說明', '怎麼登記')`);
+  assert.ok(/系統內建說明/.test(m) || /使用方式/.test(m), m.slice(0, 400));
+});
+t('有「操作手冊」分頁 -> 讀成條目並塞進 prompt', () => {
+  ssStub.tabs['操作手冊'] = makeSheet([
+    ['主題', '內容', '範例句'],
+    ['送燈時間怎麼寫', '國曆寫「國10/17前」；農曆系統不敢換算', '小幫手 石岡子乾元宮 5*7 2112盞 國10/17前'],
+    ['改燈數', '只講要改的欄位，其他不會清空', '小幫手 修改 新化武廟 4*5 OLED 總燈數變成5300盞'],
+    ['合計燈數', '', '']
+  ], '操作手冊');
+  const items = JSON.parse(run(`JSON.stringify(manualItems())`));
+  assert.strictEqual(items.length, 2, '應跳過合計列：' + JSON.stringify(items));
+  const prompt = run(`chatSystemPrompt('操作說明', '送燈時間要怎麼寫')`);
+  assert.ok(/【送燈時間怎麼寫】/.test(prompt), prompt.slice(-500));
+  assert.ok(/農曆系統不敢換算/.test(prompt));
+});
+t('手冊很長時只挑相關條目（省 token）', () => {
+  const rows = [['主題', '內容', '範例句']];
+  ['軟體', '電腦', '規格', '備註', '送燈時間', '廟宇別名', '強制新增', '補件'].forEach((k, i) => rows.push([k, k + '的說明內容，第' + i + '段', '']));
+  ssStub.tabs['操作手冊'] = makeSheet(rows, '操作手冊');
+  run(`CacheService.getScriptCache().remove('CHATMANUAL')`);
+  const picked = run(`pickManual('送燈時間 要怎麼寫')`);
+  assert.ok(/【送燈時間】/.test(picked), picked);
+  assert.ok(picked.indexOf('【軟體】') === -1, '無關條目不應進 prompt：' + picked);
 });
 
 console.log(`\n結果：${pass} 通過 / ${fail} 失敗`);

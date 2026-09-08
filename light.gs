@@ -1,73 +1,98 @@
 // ==================== 1. 光明燈規格管理設定區 ====================
+// 所有可调参数都在这里，一律「腳本屬性有值就用、沒值用預設」。
+// 函式宣告會被提前解析，所以 CONFIG 裡可以直接呼叫 sp()。
+// 注意：金鑰只寫佔位字串，實際值請填在 GAS「專案設定 → 腳本屬性」，絕對不要寫進本檔（已推到 GitHub）
+function sp(key, fallback) {
+  try {
+    var v = PropertiesService.getScriptProperties().getProperty(key);
+    if (v === null || String(v).trim() === '') return fallback;
+    return String(v).trim();
+  } catch (e) { return fallback; }
+}
+
+function spInt(key, fallback) {
+  var n = parseInt(sp(key, ''), 10);
+  return isNaN(n) ? fallback : n;
+}
+
+function spList(key, fallback) {
+  return String(sp(key, fallback)).split(/[,，]/).map(function (x) { return x.trim(); }).filter(function (x) { return x; });
+}
+
+function spOn(key, fallback) {
+  var v = sp(key, fallback ? 'ON' : '');
+  return /^(ON|YES|1|TRUE|ALL)$/i.test(v);
+}
+
 var CONFIG = {
-  // LINE 與 Gemini 的金鑰，建議在 GAS 的「專案設定 > 腳本屬性」中新增
-  // 如果想先測試，也可以直接把引號內的文字改成您的 Token / API Key 文字
-  LINE_ACCESS_TOKEN: PropertiesService.getScriptProperties().getProperty('LINE_ACCESS_TOKEN') || 'YOUR_LINE_ACCESS_TOKEN',
-  GEMINI_API_KEY: PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || 'YOUR_GEMINI_API_KEY',
-  SPREADSHEET_ID: PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || (function(){ try { return SpreadsheetApp.getActiveSpreadsheet().getId(); } catch(e) { return '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A'; } })(),
-  
-  // 已自動代入您提供的試算表 ID
-  // SPREADSHEET_ID: '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A', 
-  GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-3.6-flash',
-  // 登記資料所在的分頁名稱。LIGHT_MGMT 是主表；想換名字就在腳本屬性新增 SHEET_NAME（不用改程式）
-  // 其餘為各承攬商專屬分頁（KEY 用大寫蛇標式，值才是試算表分頁實際名稱）
+  // ---- 金鑰與資料位置 ----
+  LINE_ACCESS_TOKEN: sp('LINE_ACCESS_TOKEN', 'YOUR_LINE_ACCESS_TOKEN'),
+  GEMINI_API_KEY: sp('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY'),
+  OLLAMA_API_KEY: sp('OLLAMA_API_KEY', 'YOUR_OLLAMA_API_KEY'),      // ollama.com/settings/keys 產生
+  GEMINI_MODEL: sp('GEMINI_MODEL', 'gemini-3.6-flash'),
+  SPREADSHEET_ID: sp('SPREADSHEET_ID', (function () {
+    try { return SpreadsheetApp.getActiveSpreadsheet().getId(); } catch (e) { return 'YOUR_SPREADSHEET_ID'; }
+  })()),
+
+  // ---- 分頁名稱：LIGHT_MGMT 是主表（全部資料）；其餘是主表的唯讀投影 ----
   SHEET_NAMES: {
-    LIGHT_MGMT: (function() {
-      try { return String(PropertiesService.getScriptProperties().getProperty('SHEET_NAME') || '光明燈管理').trim(); } catch (e) { return '光明燈管理'; }
-    })(),
-    SHENG_WEN: '聖文',   // 聖文訂單分頁
-    MING_DIAN: '明典'    // 明典訂單分頁
+    LIGHT_MGMT: sp('SHEET_NAME', '光明燈管理'),
+    SHENG_WEN: '聖文',
+    MING_DIAN: '明典'
   },
 
-  // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，其他資訊一律收進 H 備註欄
+  // ---- 欄位索引（1 起算）。業務與廟宇分開兩欄，其他資訊收進備註 ----
   COLUMNS: {
-    AGENT: 1,        // A 業務
-    TEMPLE: 2,       // B 廟宇（廟方）
-    SPEC: 3,         // C 規格（例：5*7 OLED琥珀色）
-    TOTAL: 4,        // D 總燈數
-    DELIVERY: 5,     // E 送燈日期（原樣文字，例：國10/17前、已送燈）
-    SOFTWARE: 6,     // F 軟體（例：廟幫手、冠緯、其他）
-    COMPUTER: 7,     // G 電腦（例：研華、廟、研華*3）
-    REMARK: 8        // H 備註（其他資訊都放這裡；合計/小計公式請從 I 欄開始）
+    AGENT: 1, TEMPLE: 2, SPEC: 3, TOTAL: 4, DELIVERY: 5,
+    SOFTWARE: 6, COMPUTER: 7, REMARK: 8
   },
-  // 沒有独立的正規日期欄：系統推算出的國曆日期以〔國YYYY-MM-DD〕標記併入備註欄
+  // 系統推得出的國曆日期以〔國YYYY-MM-DD〕標記併入備註欄，沒有獨立的正規日期欄
   HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈時間', '軟體', '電腦', '備註'],
-  // 是否自動把國曆正規日期以〔國…〕標記寫進備註（腳本屬性 DATE_TAG_IN_REMARK=OFF 可關）
-  REMARK_DATE_TAG: (function() {
-    try { return !/^OFF|NO|0|FALSE$/i.test(String(PropertiesService.getScriptProperties().getProperty('DATE_TAG_IN_REMARK') || 'ON')); } catch (e) { return true; }
-  })(),
-  // 喚醒字：訊息開頭必須帶其中一個，系統才會解析與寫入（避免誤觸、也省 Gemini 配額）
-  // 可在腳本屬性 WAKE_WORDS 用逗號覆蓋，例：小幫手,光明燈助理
-  WAKE_WORDS: (function() {
-    try {
-      var w = PropertiesService.getScriptProperties().getProperty('WAKE_WORDS');
-      if (w) return w.split(/[,，]/).map(function(x) { return x.trim(); }).filter(function(x) { return x; });
-    } catch (e) {}
-    return ['小幫手', '小帮', '幫手', '助理'];
-  })(),
-  // 新增登記的必填欄位：缺任何一個就先請對方補，不會寫進試算表
+  REMARK_DATE_TAG: !/^OFF|NO|0|FALSE$/i.test(sp('DATE_TAG_IN_REMARK', 'ON')),
+
+  // ---- 回覆與指令行為 ----
+  WAKE_WORDS: spList('WAKE_WORDS', '小幫手,小帮,幫手,助理'),
+  REPLY_MODE: sp('REPLY_MODE', ''),                 // 設 ALL = 查詢與無關訊息也回覆
   REQUIRED_FIELDS: ['agent', 'temple', 'spec', 'total_count'],
-  // 業務欄解析優先序：句中寫的 > 該使用者綁定的 > 預設值(DEFAULT_AGENT) > LINE 暱稱(須另外開啟)
-  // 本系統預設由「聖文」承包，所以沒特別交代就上聖文；别家訂單請寫在句首（例：名典-○○宮）
-  // 換主力公司：腳本屬性 DEFAULT_AGENT = 別的公司名；設成空白則未寫業務又沒綁定時會回問
-  DEFAULT_AGENT: (function() {
-    try {
-      var v = PropertiesService.getScriptProperties().getProperty('DEFAULT_AGENT');
-      if (v !== null && String(v).trim() === '') return '';  // 明確設空 = 不用預設
-      return String(v || '聖文').trim();
-    } catch (e) { return '聖文'; }
-  })(),
-  // 沒寫業務、也沒有預設值時，是否退回自動讀 LINE 暱稱。預設 OFF：暱稱常是個人綽號
-  // 需要時在腳本屬性新增 AGENT_FROM_LINE_PROFILE = ON 開啟
-  AGENT_FROM_LINE_PROFILE: (function() {
-    try { return /^(ON|YES|1|TRUE)$/i.test(String(PropertiesService.getScriptProperties().getProperty('AGENT_FROM_LINE_PROFILE') || '')); } catch (e) { return false; }
-  })(),
   FIELD_LABELS: {
     agent: '業務／公司名', temple: '廟宇', spec: '規格', total_count: '總燈數',
     delivery_text: '送燈時間', software: '軟體', computer: '電腦', remark: '備註'
   },
-  DRAFT_TTL: 600,       // 補件草稿保留秒數（10 分鐘）
-  MAX_LIST_ROWS: 12  // 查詢/提示最多列出的筆數
+  DEFAULT_AGENT: sp('DEFAULT_AGENT', '聖文'),        // 沒寫業務時的預設承攬商；設空白則回問
+  AGENT_FROM_LINE_PROFILE: spOn('AGENT_FROM_LINE_PROFILE', false),  // 預設 OFF：暱稱常是個人綽號
+  DRAFT_TTL: spInt('DRAFT_TTL', 600),               // 補件草稿保留秒數（上限 600）
+  MAX_LIST_ROWS: spInt('MAX_LIST_ROWS', 12),
+
+  // ---- LLM 供應者：GEMINI（免錢、預設）或 OLLAMA（免費額度，1 併發）----
+  LLM: {
+    PROVIDER: sp('LLM_PROVIDER', 'GEMINI'),         // 登記解析用哪家
+    CHAT_PROVIDER: sp('CHAT_PROVIDER', ''),         // 留空=跟 PROVIDER；可單獨給聊天用 Ollama
+    OLLAMA_BASE_URL: sp('OLLAMA_BASE_URL', 'https://ollama.com'),
+    OLLAMA_MODEL: sp('OLLAMA_MODEL', 'gpt-oss:20b'),// 免費層建議 level 1~2 輕量模型
+    OLLAMA_TIMEOUT_HINT: 'Ollama 免費層只有 1 個併發，兩人同時發言會排隊或被拒（429）；' +
+                         '要穩就把 LLM_PROVIDER 設回 GEMINI，或只在 CHAT_PROVIDER 用 OLLAMA'
+  },
+
+  // ---- 聊天模式（小幫手 聊天／結束聊天、/角色）----
+  CHAT: {
+    DEFAULT_ROLE: sp('CHAT_DEFAULT_ROLE', '操作說明'),
+    HISTORY_TURNS: spInt('CHAT_HISTORY_TURNS', 5),  // 帶最近幾輪
+    HISTORY_TTL: spInt('CHAT_HISTORY_TTL', 600),
+    MODE_TTL: spInt('CHAT_MODE_TTL', 3600),         // 60 分鐘沒動作自動關回沉默模式
+    MAX_REPLY_CHARS: spInt('CHAT_MAX_CHARS', 600),  // 回覆字數上限（含標點）
+    MANUAL_SHEET: sp('CHAT_MANUAL_SHEET', '操作手冊'),
+    MANUAL_DOC_ID: sp('CHAT_MANUAL_DOC_ID', ''),    // 設了就會走 Google 文件（會多要求 Docs 授權）
+    MANUAL_MAX_CHARS: spInt('CHAT_MANUAL_MAX_CHARS', 4000),
+    ROLES: {
+      '操作說明': '你是「宮廟光明燈管理系統」的操作小幫手，專門教導經辦人如何用 LINE 登記、修改光明燈規格。' +
+                  '只根據提供的操作手冊與系統規則回答；手冊沒寫的不要編，直接說「這個我不確定，請問管理員」。' +
+                  '先給結論，再條列重點，最後附一行可直接複製的輸入範例。',
+      '禮俗顧問': '你是宮廟光明燈相關禮俗的說明人員，用繁體中文簡短回答太歲燈、光明燈、安奉與送燈等習俗問題；' +
+                  '各家廟方做法不同時要說明「以貴廟慣例為準」，不斷言對錯，也不涉及勸信。',
+      '文案助手': '你是燈務文案助手，依要求產出簡短、繁體中文、適合 LINE 或紅單列印的公告、提醒與說明文字，語氣禮貌樸實。',
+      '通用助理': '你是這個系統內的一般問答助理，以繁體中文簡短回答與工作相關的問題；不確定就明說不確定。'
+    }
+  }
 };
 
 // ==================== 2. LINE Webhook 接收端（網頁回應優化版） ====================
@@ -95,16 +120,18 @@ function doPost(e) {
       var userMessage = firstEvent.message.text;
       var userId = (firstEvent.source && firstEvent.source.userId) || 'unknown-user';
       var draft = loadDraft(userId);
+      var chatState = getChatState(userId);
 
       // 回覆策略：需要帶喚醒字（或在補件期間）才處理；查詢與不相關訊息保持沉默
-      var flow = decideFlow(userMessage, !!draft);
+      var flow = decideFlow(userMessage, !!draft, !!chatState);
 
       if (flow.mode === 'silent') {
         console.log('🔇 不回覆（' + flow.reason + '）：' + userMessage);
       } else if (flow.mode === 'command') {
         sendLineReply(replyToken, flow.handler === 'help' ? handleHelpCommand() : handleModelCommand(userMessage));
+      } else if (flow.mode === 'chatcmd') {
+        sendLineReply(replyToken, handleChatCommand(userId, flow.cmd));
       } else if (flow.mode === 'empty') {
-        // 只打了喚醒字：有草稿就提醒還缺什麼，否則回使用說明
         sendLineReply(replyToken, draft ? askMissingMessage(missingRequired(draft.details), draft.details) : handleHelpCommand());
       } else {
         var bodyText = flow.text;
@@ -114,6 +141,9 @@ function doPost(e) {
           clearDraft(userId);
           var label = bindIdentity(userId, idtCmd);
           sendLineReply(replyToken, '✅ 已記住您的業務身分：「' + label + '」\n之後登記不用每次都寫業務，未填時我就自動帶入。\n・公司派來的窗口：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 我公司 亞盛燈業 我叫 李小華 → 顯示「亞盛燈業-李小華」\n・換公司／離職：再傳一次即可蓋掉（例：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 我是 聖文）');
+        } else if (flow.chat && !draft && !looksLikeLightData(bodyText)) {
+          // 聊天模式中的純問句：直接聊，不必先花一次登記解析的呼叫
+          sendLineReply(replyToken, chatAnswer(userId, bodyText));
         } else {
           var aiInput = draft ? (draft.raw + '；補充：' + bodyText) : bodyText;
           var aiResult = analyzeMessageWithGemini(aiInput);
@@ -123,14 +153,14 @@ function doPost(e) {
             var merged = mergeDetails(draft ? draft.details : null, aiResult.details);
             var agentNote = '';
             if (String(merged.agent || '').trim() === '') {
-              var idt = getUserIdentity(userId);   // 先取本人綁定的公司／人員
+              var idt = getUserIdentity(userId);
               if (idt.source === 'bind' && idt.name) {
                 merged.agent = idt.name;
                 agentNote = '\n👤 業務自動帶入（您的綁定）：' + idt.name + '（換人/換公司：傳「我是 ○○」或「我公司 ○○ 我叫 ○○」）';
-              } else if (CONFIG.DEFAULT_AGENT) {   // 沒綁定 → 用預設承攬商
+              } else if (CONFIG.DEFAULT_AGENT) {
                 merged.agent = CONFIG.DEFAULT_AGENT;
                 agentNote = '\n👤 業務預設帶入：' + CONFIG.DEFAULT_AGENT + '（若是别家訂單請寫在句首，或傳「我是 ○○」綁定您的公司）';
-              } else if (idt.name) {               // 沒預設 → 才考慮 LINE 暱稱（須開 AGENT_FROM_LINE_PROFILE）
+              } else if (idt.name) {
                 merged.agent = idt.name;
                 agentNote = '\n👤 業務自動帶入 LINE 暱稱「' + idt.name + '」，若應填公司名稱請傳「我公司 您的公司名」修正。';
               }
@@ -143,16 +173,19 @@ function doPost(e) {
               clearDraft(userId);
               sendLineReply(replyToken, handleDataRouting({ action: 'CREATE', details: merged }, aiInput, userId) + agentNote);
             }
-          } else if (!shouldReplyFor(act)) {
-            console.log('🔇 不回覆（AI 判定意圖 ' + (act || '未知') + '，非新增/修改）：' + bodyText);
-          } else {
+          } else if (shouldReplyFor(act)) {
             if (draft) clearDraft(userId);
-            sendLineReply(replyToken, handleDataRouting(aiResult, aiInput));
+            sendLineReply(replyToken, handleDataRouting(aiResult, aiInput, userId));
+          } else if (flow.chat) {
+            // 聊天模式下被判定為查詢／無關 → 当成對話回，不沉默
+            sendLineReply(replyToken, chatAnswer(userId, bodyText));
+          } else {
+            console.log('🔇 不回覆（AI 判定意圖 ' + (act || '未知') + '，非新增/修改）：' + bodyText);
           }
         }
       }
     }
-    
+
   } catch (error) {
     console.error('doPost 發生錯誤: ' + error.toString());
     // 只有「使用者本來就期望有回應」的訊息（指令或寫入類）才打擾；沉默類只留日誌
@@ -160,7 +193,7 @@ function doPost(e) {
       var errEvent = JSON.parse(e.postData.contents).events[0];
       var errText = (errEvent && errEvent.message && errEvent.message.text) || '';
       var errUid = (errEvent && errEvent.source && errEvent.source.userId) || 'unknown-user';
-      if (errEvent && errEvent.replyToken && decideFlow(errText, !!loadDraft(errUid)).mode !== 'silent') {
+      if (errEvent && errEvent.replyToken && decideFlow(errText, !!loadDraft(errUid), !!getChatState(errUid)).mode !== 'silent') {
         sendLineReply(errEvent.replyToken, "【⚠️ 系統異常】" + error.toString());
       }
     } catch (e2) {}
@@ -364,10 +397,7 @@ function fetchLineDisplayName(userId) {
 // ==================== 2.4 回覆策略（只回「會動到資料」的訊息） ====================
 // 腳本屬性 REPLY_MODE = ALL 可恢復「全部回覆」（含查詢與 AI 判定為 READ 的訊息）
 function isReplyAllMode() {
-  try {
-    var v = PropertiesService.getScriptProperties().getProperty('REPLY_MODE') || '';
-    return /^(ALL|全部|所有|ON)$/i.test(String(v).trim());
-  } catch (e) { return false; }
+  return /^(ALL|全部|所有|ON)$/i.test(String(CONFIG.REPLY_MODE || '').trim());
 }
 
 // 查詢類語氣（不含寫入動詞）：這種訊息不需要打扰使用者，也不需要花 Gemini 配額
@@ -389,8 +419,9 @@ function looksLikeLightData(text) {
   return false;
 }
 
-// 決定這則訊息要處理、回指令、還是完全沉默（hasDraft=true 代表該使用者有待補件草稿）
-function decideFlow(text, hasDraft) {
+// 決定這則訊息要處理、回指令、還是完全沉默
+// hasDraft：該使用者有 10 分鐘內的補件草稿；chatOn：處於聊天模式（免喚醒字、問句都回）
+function decideFlow(text, hasDraft, chatOn) {
   var t = String(text || '').trim();
   if (!t) return { mode: 'silent', reason: '空訊息' };
   if (isHelpCommand(t)) return { mode: 'command', handler: 'help' };
@@ -398,16 +429,19 @@ function decideFlow(text, hasDraft) {
 
   var stripped = stripWakeWord(t);
   var woke = stripped !== null;
+  var body = woke ? stripped : t;
 
-  if (!woke && !hasDraft && !isReplyAllMode()) {
+  var cc = parseChatCommand(body) || (woke ? null : parseChatCommand(t));
+  if (cc) return { mode: 'chatcmd', cmd: cc };
+
+  if (!woke && !hasDraft && !chatOn && !isReplyAllMode()) {
     return { mode: 'silent', reason: '未帶喚醒字（' + (CONFIG.WAKE_WORDS || []).join('/') + '）' };
   }
-  var body = woke ? stripped : t;
   if (!body) return { mode: 'empty', text: '' };
-  if (isReadOnlyAsking(body) && !isReplyAllMode()) {
+  if (!chatOn && isReadOnlyAsking(body) && !isReplyAllMode()) {
     return { mode: 'silent', reason: '查詢類，請直接用瀏覽器開試算表' };
   }
-  return { mode: 'ai', text: body, woke: woke };
+  return { mode: 'ai', text: body, woke: woke, chat: !!chatOn };
 }
 
 // AI 判定後的最終把關：只有寫入類意圖（含寫入失敗的提示）才回訊
@@ -491,7 +525,13 @@ function handleHelpCommand() {
     '',
     '🔍 3. 查詢：建議直接用瀏覽器開試算表（LINE 端查詢不回訊）',
     '',
-    '🤖 4. AI 模型管理',
+    '💬 4. 聊天模式（會開始每句都回你）',
+    '　 ' + wake + ' 聊天　　　　進入（之後免打喚醒字）',
+    '　 ' + wake + ' 結束聊天　　離開並清空對話記憶',
+    '　 ' + wake + ' 角色　　　　看可選角色；' + wake + ' 角色 文案助手　換角色',
+    '　 目前角色：' + (CONFIG.CHAT.DEFAULT_ROLE || '操作說明') + '（回答依操作手冊，上限 ' + chatCharLimit() + ' 字；' + Math.round(CONFIG.CHAT.MODE_TTL / 60) + ' 分鐘沒動自動關閉）',
+    '',
+    '🤖 5. AI 模型管理',
     '　 /model　　　　　查看目前模型與可用清單',
     '　 /model <模型名>　切換指定模型',
     '　 /model auto　　　恢復自動模式',
@@ -503,8 +543,8 @@ function handleHelpCommand() {
     '　　・推得出的國曆日期會以〔國2026-10-17〕標記自動併進備註欄（關掉：腳本屬性 DATE_TAG_IN_REMARK=OFF）',
     '💡 合計／小計公式請放最右側欄（I 欄以後），機器人只寫 A~H，絕不動到你的公式',
     '',
-    '🔕 回覆規則：只在「新增／修改」與「資料不全需補件」時回訊',
-    '　 未帶喚醒字、查詢、閒聊一律不回覆',
+    '🔕 回覆規則：只在「新增／修改」「資料不全需補件」或「聊天模式進行中」時回訊',
+    '　 未帶喚醒字、查詢、閒聊一律不回覆（聊天模式除外）',
     '　 想恢復全部回覆：GAS 專案設定 → 腳本屬性 → 新增 REPLY_MODE = ALL',
     '━━━━━━━━━━━━━━',
     '✨ 帶「' + wake + '」開頭直接輸入登記內容；輸入 /help 隨時回來看說明。'
@@ -594,10 +634,43 @@ function analyzeMessageWithGemini(text) {
                "輸入:「查一下金六結福德廟有哪些燈」\n" +
                "輸出: {\"action\":\"READ\",\"details\":{\"agent\":null,\"temple\":\"金六結福德廟\",\"spec\":null,\"total_count\":null,\"delivery_text\":null,\"software\":null,\"computer\":null,\"remark\":null}}";
 
-  var payload = {
-    "contents": [{ "parts": [{ "text": prompt }] }],
-    "generationConfig": { "responseMimeType": "application/json" }
-  };
+  return askLLM({ user: prompt, wantJson: true, purpose: 'parse' });
+}
+
+// ==================== 3.5 LLM 傳輸層（GEMINI / OLLAMA） ====================
+// purpose: 'parse'（登記解析）或 'chat'（聊天模式）；兩者可用不同供應者省額度
+function providerFor(purpose) {
+  var base = (CONFIG.LLM.PROVIDER || 'GEMINI').toUpperCase();
+  var p = purpose === 'chat' ? (CONFIG.LLM.CHAT_PROVIDER || base) : CONFIG.LLM.PROVIDER;
+  p = String(p).toUpperCase();
+  return (p === 'OLLAMA' || p === 'GEMINI') ? p : 'GEMINI';
+}
+
+// opts = { system, user, history:[{role:'user'|'assistant',text}], wantJson, purpose, model }
+function askLLM(opts) {
+  var provider = providerFor(opts.purpose || 'parse');
+  if (provider === 'OLLAMA') return askOllama(opts);
+  return askGemini(opts);
+}
+
+function stripJsonFence(text) {
+  return String(text || '').replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+}
+
+function buildParsePromptText(opts) {
+  var chunks = [];
+  if (opts.system) chunks.push(opts.system);
+  (opts.history || []).forEach(function (h) {
+    chunks.push((h.role === 'assistant' ? '助理：' : '使用者：') + String(h.text));
+  });
+  chunks.push(opts.user || '');
+  return chunks.join('\n');
+}
+
+function askGemini(opts) {
+  var prompt = opts.system ? buildParsePromptText(opts) : opts.user;
+  var payload = { "contents": [{ "parts": [{ "text": prompt }] }] };
+  if (opts.wantJson) payload.generationConfig = { "responseMimeType": "application/json" };
 
   var options = {
     "method": "post",
@@ -606,11 +679,10 @@ function analyzeMessageWithGemini(text) {
     "muteHttpExceptions": true
   };
 
-  // 嘗試順序：手動鎖定模型 > 預設模型 > 自動探測的最新可用模型
-  var manualModel = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL');
-  var order = dedupe([manualModel, CONFIG.GEMINI_MODEL].concat(getCandidateModels())).slice(0, 6);
-  var lastErr = '';
-  var lastCode = 0;
+  // 嘗試順序：指定模型 > 手動鎖定 > 預設模型 > 自動探測的最新可用模型
+  var manualModel = CONFIG.GEMINI_MODEL;
+  var order = dedupe([opts.model, manualModel, CONFIG.GEMINI_MODEL].concat(getCandidateModels())).slice(0, 6);
+  var lastErr = '', lastCode = 0;
 
   for (var mi = 0; mi < order.length; mi++) {
     var tryUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + order[mi] + ":generateContent?key=" + CONFIG.GEMINI_API_KEY;
@@ -621,7 +693,7 @@ function analyzeMessageWithGemini(text) {
     if (respCode !== 200) {
       lastErr = '模型 ' + order[mi] + ' (HTTP ' + respCode + '): ' + bodyText.substring(0, 200);
       lastCode = respCode;
-      // 429/503 屬暫時性（配額或壅塞），每个模型各自獨立，繼續換下一個並稍作等待
+      // 429/503 屬暫時性（配額或壅塞），每個模型各自獨立，繼續換下一個並稍作等待
       if ((respCode === 429 || respCode === 500 || respCode === 503 || respCode === 504) && mi < order.length - 1) {
         Utilities.sleep(1200);
       }
@@ -634,8 +706,8 @@ function analyzeMessageWithGemini(text) {
         continue;
       }
       var parts = jsonResponse.candidates[0].content.parts || [];
-      var aiText = parts.map(function(p){ return p.text || ''; }).join('').trim();
-      return JSON.parse(aiText);
+      var aiText = parts.map(function (p) { return p.text || ''; }).join('').trim();
+      return opts.wantJson ? JSON.parse(stripJsonFence(aiText)) : aiText;
     } catch (e) {
       lastErr = '模型 ' + order[mi] + ' 解析失敗: ' + e.toString();
       continue;
@@ -648,6 +720,302 @@ function analyzeMessageWithGemini(text) {
     throw new Error('AI 免費配額暫時用盡（已嘗試 ' + order.length + ' 個模型），請稍後重試或輸入「/model gemini-3.1-flash-lite」。');
   }
   throw new Error('Gemini API 異常: ' + lastErr);
+}
+
+// Ollama：https://ollama.com/api/chat，Bearer token；免費層 1 併發
+function askOllama(opts) {
+  var key = CONFIG.OLLAMA_API_KEY || '';
+  if (!key || key === 'YOUR_OLLAMA_API_KEY') {
+    throw new Error('要用 Ollama 請在 GAS「專案設定 → 腳本屬性」新增 OLLAMA_API_KEY（到 ollama.com/settings/keys 產生），不要寫進程式檔');
+  }
+
+  var base = String(CONFIG.LLM.OLLAMA_BASE_URL).replace(/\/+$/, '');
+  var msgs = [];
+  if (opts.system) {
+    msgs.push({ role: 'system', content: opts.system + (opts.wantJson ? '\n【輸出硬性要求】只輸出 JSON 物件本身，不要 markdown 程式碼塊、不要任何說明文字。' : '') });
+  }
+  (opts.history || []).forEach(function (h) {
+    msgs.push({ role: h.role === 'assistant' ? 'assistant' : 'user', content: String(h.text) });
+  });
+  msgs.push({ role: 'user', content: opts.wantJson && !opts.system ? buildParsePromptText(opts) : (opts.user || '') });
+
+  var payload = {
+    model: opts.model || CONFIG.LLM.OLLAMA_MODEL,
+    messages: msgs,
+    stream: false,
+    options: { temperature: opts.wantJson ? 0 : 0.6 }
+  };
+  if (opts.wantJson) payload.format = 'json';
+
+  var resp = UrlFetchApp.fetch(base + '/api/chat', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'Authorization': 'Bearer ' + key },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+  var code = resp.getResponseCode(), text = resp.getContentText();
+  if (code !== 200) {
+    throw new Error('Ollama API HTTP ' + code + '：' + String(text).substring(0, 160) + '｜' + CONFIG.LLM.OLLAMA_TIMEOUT_HINT);
+  }
+  var json;
+  try { json = JSON.parse(text); } catch (e) {
+    throw new Error('Ollama 回覆解析失敗：' + String(text).substring(0, 160));
+  }
+  var content = (json && json.message && json.message.content) ? String(json.message.content) : '';
+  if (!opts.wantJson) return content.trim();
+  try {
+    return JSON.parse(stripJsonFence(content));
+  } catch (e2) {
+    throw new Error('Ollama 沒回出可解析的 JSON（模型太輕或不聽 format 參數）。建議把解析改回 GEMINI、只用 Ollama 聊天：腳本屬性 LLM_PROVIDER=GEMINI、CHAT_PROVIDER=OLLAMA');
+  }
+}
+
+// 三家连通性自检：在 GAS 编辑器执行，结果看「执行记录」
+function testLLMProviders() {
+  var rows = [];
+  ['GEMINI', 'OLLAMA'].forEach(function (provider) {
+    var t0 = new Date().getTime(), out;
+    try {
+      var r = askLLM({ system: '你是连线测试。只回覆两个字：OK', user: 'ping', wantJson: false, provider: provider });
+      out = '✅ ' + String(r).substring(0, 20);
+    } catch (e) {
+      out = '❌ ' + e.message;
+    }
+    rows.push(provider + '（' + ((new Date().getTime()) - t0) + 'ms）：' + out);
+  });
+  Logger.log(rows.join('\n'));
+  return rows.join('\n');
+}
+
+
+// ==================== 3.6 聊天模式：開關、角色、操作手冊、對話記憶 ====================
+var CHAT_STATE_KEY = 'USER_CHAT';
+
+function readChatStates() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(CHAT_STATE_KEY) || '{}'); } catch (e) { return {}; }
+}
+
+function writeChatStates(map) {
+  var keys = Object.keys(map);
+  if (keys.length > 300) {
+    keys.sort(function (a, b) { return (map[a].at || 0) - (map[b].at || 0); });
+    keys.slice(0, keys.length - 300).forEach(function (k) { delete map[k]; });
+  }
+  try { PropertiesService.getScriptProperties().setProperty(CHAT_STATE_KEY, JSON.stringify(map)); } catch (e) {}
+}
+
+// 聊天模式超過 MODE_TTL 沒有動作就自動關（不會有人忘了關，之後每句話都被回覆）
+function getChatState(userId) {
+  var st = readChatStates()[String(userId)];
+  if (!st || !st.on) return null;
+  if ((new Date().getTime()) - (st.at || 0) > CONFIG.CHAT.MODE_TTL * 1000) return null;
+  return st;
+}
+
+function setChatState(userId, on, role) {
+  var map = readChatStates(), k = String(userId), cur = map[k] || {};
+  map[k] = on
+    ? { on: true, role: role || cur.role || CONFIG.CHAT.DEFAULT_ROLE, at: new Date().getTime() }
+    : { on: false, role: cur.role || CONFIG.CHAT.DEFAULT_ROLE, at: 0 };
+  writeChatStates(map);
+  return map[k];
+}
+
+// ---- 對話記憶（CacheService 上限 600 秒，與 HISTORY_TTL 搭配）----
+function historyKey(userId) { return 'CHATHIST_' + userId; }
+
+function loadHistory(userId) {
+  try {
+    var c = CacheService.getScriptCache().get(historyKey(userId));
+    if (c) return JSON.parse(c) || [];
+  } catch (e) {}
+  return [];
+}
+
+function pushHistory(userId, userText, aiText) {
+  var h = loadHistory(userId);
+  h.push({ role: 'user', text: String(userText).substring(0, 500) });
+  h.push({ role: 'assistant', text: String(aiText).substring(0, 1200) });
+  var max = Math.max(2, CONFIG.CHAT.HISTORY_TURNS * 2);
+  if (h.length > max) h = h.slice(h.length - max);
+  try { CacheService.getScriptCache().put(historyKey(userId), JSON.stringify(h), CONFIG.CHAT.HISTORY_TTL); } catch (e) {}
+  return h;
+}
+
+function clearHistory(userId) {
+  try { CacheService.getScriptCache().remove(historyKey(userId)); } catch (e) {}
+}
+
+// ---- 操作手冊：Google 文件 → 「操作手冊」分頁 → /help 內建文案 ----
+function manualItems() {
+  var cacheKey = 'CHATMANUAL';
+  try {
+    var c = CacheService.getScriptCache().get(cacheKey);
+    if (c) return JSON.parse(c);
+  } catch (e) {}
+
+  var items = manualFromDoc();
+  if (!items.length) items = manualFromSheet();
+  if (!items.length) items = [{ topic: '系統內建說明', body: handleHelpCommand(), sample: '' }];
+
+  try { CacheService.getScriptCache().put(cacheKey, JSON.stringify(items).substring(0, 95000), CONFIG.CHAT.HISTORY_TTL); } catch (e) {}
+  return items;
+}
+
+function manualFromDoc() {
+  var id = CONFIG.CHAT.MANUAL_DOC_ID;
+  if (!id) return [];
+  try {
+    var text = String(DocumentApp.openById(id).getBody().getText());
+    var paras = text.split(/\n\s*\n/), out = [];
+    paras.forEach(function (para) {
+      var lines = String(para).split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l; });
+      if (!lines.length) return;
+      if (/合計|小計|總計/.test(lines[0])) return;
+      out.push({ topic: lines[0].substring(0, 40), body: lines.join('\n'), sample: '' });
+    });
+    return out;
+  } catch (e) {
+    console.log('讀 Google 文件手冊失敗（通常是沒啟用 DocumentApp 服務或未授權）：' + e.toString());
+    return [];
+  }
+}
+
+function manualFromSheet() {
+  try {
+    var sheet = getSpreadsheet().getSheetByName(CONFIG.CHAT.MANUAL_SHEET);
+    if (!sheet) return [];
+    var data = sheet.getDataRange().getValues(), out = [];
+    for (var i = 1; i < data.length; i++) {
+      var topic = String(data[i][0] || '').trim(), body = String(data[i][1] || '').trim(), sample = String(data[i][2] || '').trim();
+      if (!topic && !body) continue;
+      if (/合計|小計|總計/.test(topic)) continue;
+      out.push({ topic: topic, body: body, sample: sample });
+    }
+    return out;
+  } catch (e) {
+    console.log('讀操作手冊分頁失敗：' + e.toString());
+    return [];
+  }
+}
+
+// 只挑與問句最相關的幾條進 prompt，省 token 也比較不會答非所問
+function pickManual(question) {
+  var items = manualItems();
+  var q = String(question || '');
+  if (items.length <= 4) return renderManual(items);
+
+  var scored = items.map(function (it, idx) {
+    var hay = it.topic + ' ' + it.body, score = 0;
+    for (var i = 0; i + 2 <= hay.length; i++) {
+      var gram = hay.substr(i, 2);
+      if (q.indexOf(gram) !== -1) score += 1;
+    }
+    Object.keys(CONFIG.FIELD_LABELS).forEach(function (k) {
+      if (q.indexOf(CONFIG.FIELD_LABELS[k]) !== -1 && (it.topic + it.body).indexOf(CONFIG.FIELD_LABELS[k]) !== -1) score += 4;
+    });
+    return { it: it, score: score, idx: idx };
+  });
+  scored.sort(function (a, b) { return b.score - a.score || a.idx - b.idx; });
+  var hits = scored.filter(function (x) { return x.score > 0; }).slice(0, 5).map(function (x) { return x.it; });
+  if (!hits.length) hits = scored.slice(0, 3).map(function (x) { return x.it; });   // 一個都沒命中，才給開頭幾條當背景
+  return renderManual(hits);
+}
+
+function renderManual(items) {
+  var out = items.map(function (it) {
+    return '【' + (it.topic || '未訂標題') + '】' + it.body + (it.sample ? '\n　可複製範例：' + it.sample : '');
+  }).join('\n');
+  return out.length > CONFIG.CHAT.MANUAL_MAX_CHARS ? out.substring(0, CONFIG.CHAT.MANUAL_MAX_CHARS) + '…（手冊過長已截斷）' : out;
+}
+
+function chatSystemPrompt(role, question) {
+  return (CONFIG.CHAT.ROLES[role] || CONFIG.CHAT.ROLES[CONFIG.CHAT.DEFAULT_ROLE]) + '\n\n' +
+    '【這套系統的硬性規則】\n' +
+    '1. 經辦人要傳「' + (CONFIG.WAKE_WORDS[0] || '小幫手') + '」開頭的訊息系統才會處理（聊天模式進行中則免）\n' +
+    '2. 必填欄位：' + (CONFIG.REQUIRED_FIELDS || []).map(function (k) { return CONFIG.FIELD_LABELS[k]; }).join('、') + '；缺件不上表，系統會回問\n' +
+    '3. 寫入的分頁是「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」，欄位依序：' + CONFIG.HEADERS.join('、') + '；合計/小計公式請放 I 欄以後\n' +
+    '4. 業務欄沒寫時：先用本人綁定的公司／人員，再退回預設「' + (CONFIG.DEFAULT_AGENT || '（未設定，會回問）') + '」\n' +
+    '5. 系統只在「新增／修改／補件」時回訊；查詢建議直接用瀏覽器開試算表\n\n' +
+    '【回覆長度硬性規定】全繁體中文，' + chatCharLimit() + '字以內（含標點）；' +
+    '先講結論再條列重點，最多 4 條，不要寒暄、不要重複題目、不要列參考來源；' +
+    '需要更長的說明就請對方再問\n\n' +
+    '【操作手冊（只能以此為準；沒寫到的就說不確定，不要編造）】\n' + pickManual(question);
+}
+
+// 聊天回覆字數上限：腳本屬性 CHAT_MAX_CHARS 優先，抓 200~2000 中間值避免被人設成 0 或超長
+function chatCharLimit() {
+  var n = parseInt(CONFIG.CHAT.MAX_REPLY_CHARS, 10);
+  if (isNaN(n)) n = 600;
+  return Math.min(2000, Math.max(80, n));   // 夾住，避免被設成 0 或超長
+}
+
+// 真正回一句聊天；provider 由 CHAT_PROVIDER 決定（可與登記解析不同）
+function chatAnswer(userId, question) {
+  var st = getChatState(userId) || setChatState(userId, true);
+  var role = st.role || CONFIG.CHAT.DEFAULT_ROLE;
+  var system = chatSystemPrompt(role, question);
+
+  var text = askLLM({ system: system, user: String(question).substring(0, 1500), history: loadHistory(userId), wantJson: false, purpose: 'chat' });
+  text = clipChatReply(text);
+  pushHistory(userId, question, text);
+  setChatState(userId, true, role);   // 續命，避免講到一半自動關
+  return '💬【' + role + '】\n' + text;
+}
+
+// 模型常常不聽字數指示，回傳前自己再硬截一道（保留行尾，標明被截斷）
+function clipChatReply(text) {
+  var limit = chatCharLimit();
+  var t = String(text || '').replace(/\r/g, '').trim();
+  if (!t) return '（沒什麼回應，再問一次看看）';
+  if (t.length <= limit) return t;
+  var cut = t.lastIndexOf('\n', limit);
+  if (cut < Math.floor(limit * 0.6)) cut = limit;
+  return t.substring(0, cut).trim() + '\n…（已限制 ' + limit + ' 字，要更詳細請再問一句）';
+}
+
+// ---- 聊天相關指令解析 ----
+// 回傳 null 代表不是聊天指令；否則 {action:'on'|'off'|'roles'|'role', role}
+function parseChatCommand(text) {
+  var raw = String(text || '').trim();
+  var squashed = raw.replace(/[\s　]+/g, '').toLowerCase();
+  if (/^(\/chat|\/聊天|聊天|聊天模式|進入聊天|開聊天|開始聊天)$/.test(squashed)) return { action: 'on' };
+  if (/^(\/chatoff|\/chat:off|\/結束聊天|結束聊天|離開聊天|退出聊天|結束對話|不聊了)$/.test(squashed)) return { action: 'off' };
+  var m = raw.match(/^\/?\s*(?:角色|role)(?:\s+(.{1,20}))?$/i);
+  if (m) return { action: m[1] ? 'role' : 'roles', role: String(m[1] || '').trim() };
+  return null;
+}
+
+function handleChatCommand(userId, cmd) {
+  var roleList = Object.keys(CONFIG.CHAT.ROLES);
+  if (cmd.action === 'on') {
+    var st = setChatState(userId, true);
+    return '💬 已進入【聊天模式】（目前角色：' + st.role + '）\n' +
+           '・往後每則訊息都會回你，不用再打「' + (CONFIG.WAKE_WORDS[0] || '小幫手') + '」\n' +
+           '・登記類訊息仍會優先入表（例：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 石岡子乾元宮 5*7 OLED 2112盞）\n' +
+           '・換角色：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 角色 清單　或　' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 角色 ' + (Object.keys(CONFIG.CHAT.ROLES)[1] || '') + '\n' +
+           '・結束：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 結束聊天（或 ' + Math.round(CONFIG.CHAT.MODE_TTL / 60) + ' 分鐘沒動會自動關）';
+  }
+  if (cmd.action === 'off') {
+    setChatState(userId, false);
+    clearHistory(userId);
+    return '🔕 已結束聊天模式，恢復只回「新增／修改／補件」\n輸入 /help 可再看使用方式。';
+  }
+  if (cmd.action === 'roles') {
+    var cur = (getChatState(userId) || {}).role || CONFIG.CHAT.DEFAULT_ROLE;
+    return '🎭 可選角色（目前：' + cur + '）\n' +
+      roleList.map(function (r, i) {
+        return '  ' + (i + 1) + '. ' + r + (r === cur ? ' ← 使用中' : '') + '：' + String(CONFIG.CHAT.ROLES[r]).substring(0, 28) + '…';
+      }).join('\n') +
+      '\n切換：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 角色 ' + roleList[1];
+  }
+  var want = cmd.role;
+  var hit = null;
+  roleList.forEach(function (r) { if (!hit && (r === want || r.indexOf(want) !== -1 || want.indexOf(r) !== -1)) hit = r; });
+  if (!hit) return '❌ 沒有這個角色：「' + want + '」\n可選：' + roleList.join('／');
+  setChatState(userId, true, hit);
+  return '🎭 已切換角色：' + hit + '（聊天模式同時開啟中；結束請傳「結束聊天」）';
 }
 
 // ==================== 4. 核心業務邏輯：新增、修改、查詢 ====================
@@ -1159,32 +1527,62 @@ function doRead(sheet, d, originalText) {
   return head + '\n\n' + lines.join('\n------------------\n') + tail;
 }
 
-// ==================== 5. LINE 回傳訊息工具 ====================
+// ==================== 5. LINE 回傳訊息工具（見 5.5 送出層） ====================
+// ==================== 5.5 LINE 送出層（單則 5000 字上限、一次最多 5 則） ====================
+var LINE_TEXT_LIMIT = 4800;   // 官方單則 text 上限 5000 字元，留 200 字安全餘量
+var LINE_MAX_MESSAGES = 5;    // 官方：一次 reply 最多 5 個 message objects
+
+// 依換行切段，切點太爛就硬切，避免把一個字元/半個網址切開
+function splitLineText(text, size) {
+  var s = String(text === null || text === undefined ? '' : text).replace(/\r/g, '');
+  var out = [];
+  while (s.length > size) {
+    var cut = s.lastIndexOf('\n', size);
+    if (cut < Math.floor(size * 0.5)) cut = size;
+    out.push(s.substring(0, cut));
+    s = s.substring(cut).replace(/^\n+/, '');
+  }
+  if (s.length) out.push(s);
+  return out.length ? out : [''];
+}
+
+// 超長內容：先切則，超過 5 則就把多出的部分省略並告知
+function prepareLineMessages(messageText) {
+  var chunks = splitLineText(messageText, LINE_TEXT_LIMIT);
+  if (chunks.length <= LINE_MAX_MESSAGES) return chunks;
+
+  var kept = chunks.slice(0, LINE_MAX_MESSAGES - 1);
+  var dropped = chunks.slice(LINE_MAX_MESSAGES - 1).join('\n');
+  kept.push(dropped.substring(0, LINE_TEXT_LIMIT - 120) +
+            '\n……（內容過長，已省略約 ' + (dropped.length - (LINE_TEXT_LIMIT - 120)) + ' 字；請改用瀏覽器看試算表，或縮小問題再問一次）');
+  return kept;
+}
+
 function sendLineReply(replyToken, messageText) {
   // ⭐ 必須是這個完整的官方 API 網址，LINE 才能收到你的回信
   var url = "https://api.line.me/v2/bot/message/reply";
-  
-  var payload = {
-    "replyToken": replyToken,
-    "messages": [{ "type": "text", "text": messageText }]
-  };
-  
+  var messages = prepareLineMessages(messageText).map(function (t) {
+    return { "type": "text", "text": t };
+  });
+
+  var payload = { "replyToken": replyToken, "messages": messages };
   var options = {
     "method": "post",
-    "headers": {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + CONFIG.LINE_ACCESS_TOKEN
-    },
+    "contentType": "application/json",
+    "headers": { "Authorization": "Bearer " + CONFIG.LINE_ACCESS_TOKEN },
     "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true // 💡 加上這一行，就算 LINE 拒絕，GAS 也不會整支崩潰，會在日誌留下紀錄
+    "muteHttpExceptions": true // 被 LINE 拒絕時 GAS 不會崩潰，但一定要把狀態碼讀出來報錯
   };
-  
-  // 執行發送
+
   var response = UrlFetchApp.fetch(url, options);
-  
-  // 可以在日誌中查看 LINE 回傳的狀態，方便抓漏
-  console.log("LINE 回應狀態碼: " + response.getResponseCode());
-  console.log("LINE 回應內容: " + response.getContentText());
+  var code = response.getResponseCode(), body = response.getContentText();
+  console.log('LINE 回應狀態碼: ' + code + '（送出 ' + messages.length + ' 則、' + String(messageText || '').length + ' 字）');
+  if (code !== 200) {
+    // 以前這裡只 log，結果超長或被拒時使用者只看到「沒回訊」，現在把原因丟回去
+    console.error('LINE 送出失敗: ' + body);
+    throw new Error('LINE 送出失敗 HTTP ' + code + '：' + String(body).substring(0, 200));
+  }
+  return messages.length;
 }
 
 // ==================== 6. 網頁瀏覽器直接開啟端 (GET) ====================
