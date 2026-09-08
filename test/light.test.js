@@ -108,6 +108,26 @@ function load() {
       return ok('{}');
     } },
     HtmlService: { createHtmlOutput: x => ({ content: x }) },
+    DocumentApp: {
+      openById: id => {
+        const f = (ctx.FOLDER || []).find(x => x.id === id);
+        if (!f) throw new Error('no doc ' + id);
+        return { getBody: () => ({ getText: () => f.text }) };
+      }
+    },
+    DriveApp: {
+      getFolderById: () => {
+        const files = (ctx.FOLDER || []).filter(f => !f.standalone);
+        let i = 0;
+        return { getFiles: () => ({ hasNext: () => i < files.length, next: () => {
+          const f = files[i++];
+          return {
+            getName: () => f.name, getMimeType: () => f.mime, getId: () => f.id,
+            getBlob: () => ({ getDataAsString: () => f.text })
+          };
+        } }) };
+      }
+    },
     Logger: { log() {} }, console
   };
   vm.createContext(ctx);
@@ -126,6 +146,8 @@ function reset() {
   run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false; CONFIG.SPREADSHEET_ID = "FAKE";');
   cacheStore = {}; sent = []; ollamaCalls = []; geminiCalls = [];
   ctx.OLLAMA_REPLY = ''; ctx.GEMINI_TEXT = ''; ctx.HTTP_CODE = 200; delete ctx.__props.OLLAMA_API_KEY;
+  ctx.FOLDER = [];
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = ""; CONFIG.CHAT.MANUAL_DOC_ID = ""; CONFIG.CHAT.MANUAL_MAX_FILES = 10;');
   ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS;
   run('CONFIG.REPLY_MODE = ""; CONFIG.OLLAMA_API_KEY = "YOUR_OLLAMA_API_KEY";');
   run('CONFIG.LLM.PROVIDER = "GEMINI"; CONFIG.LLM.CHAT_PROVIDER = ""; CONFIG.LLM.OLLAMA_MODEL = "gpt-oss:20b";');
@@ -916,6 +938,67 @@ t('手冊很長時只挑相關條目（省 token）', () => {
   const picked = run(`pickManual('送燈時間 要怎麼寫')`);
   assert.ok(/【送燈時間】/.test(picked), picked);
   assert.ok(picked.indexOf('【軟體】') === -1, '無關條目不應進 prompt：' + picked);
+});
+
+
+console.log('\n【操作手冊：Drive 資料夾來源與可用格式】');
+const setFolder = files => { ctx.FOLDER = files; run(`CacheService.getScriptCache().remove('CHATMANUAL')`) };
+t('Google 文件：段落切成條目，主題帶檔名方便引用', () => {
+  setFolder([{ id: 'D1', name: '光明燈操作手冊', mime: 'application/vnd.google-apps.document',
+    text: '送燈時間怎麼寫\n國曆寫「國10/17前」，農曆系統不敢換算。\n\n改燈數\n只講要改的欄位，其他不會清空。' }]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items.length, 2, JSON.stringify(items));
+  assert.strictEqual(items[0].topic, '光明燈操作手冊｜送燈時間怎麼寫');
+  assert.ok(/農曆系統不敢換算/.test(items[0].body));
+});
+t('.md 與 .txt 也能讀，並清掉 markdown 符號', () => {
+  setFolder([{ id: 'T1', name: 'manual.md', mime: 'text/markdown', text: '## 強制新增\n同廟同規格要當**第二批**時加這四個字。\n\n## 備註欄\n寫「備註：…」才會進 H 欄。' }]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items.length, 2);
+  assert.ok(!/#|\*\*/.test(items[0].topic), '主題不該殘留 # 或 **：' + items[0].topic);
+  assert.ok(items[0].body.indexOf('**') === -1, items[0].body);
+});
+t('PDF 與上傳的 .docx 會被跳過（讀不到文字）', () => {
+  setFolder([
+    { id: 'P1', name: '說明.pdf', mime: 'application/pdf', text: '' },
+    { id: 'P2', name: '說明.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', text: '' },
+    { id: 'P3', name: '真的可用', mime: 'application/vnd.google-apps.document', text: '只有這筆可用' }
+  ]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items.length, 1, JSON.stringify(items));
+  assert.strictEqual(items[0].topic, '真的可用｜只有這筆可用');
+});
+t('MANUAL_MAX_FILES 限制讀取的檔案數', () => {
+  setFolder([
+    { id: 'A', name: 'A', mime: 'application/vnd.google-apps.document', text: '第一份\n內容A' },
+    { id: 'B', name: 'B', mime: 'application/vnd.google-apps.document', text: '第二份\n內容B' }
+  ]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"; CONFIG.CHAT.MANUAL_MAX_FILES = 1');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items.length, 1, JSON.stringify(items));
+  assert.ok(/內容A|第一份/.test(items[0].topic + items[0].body));
+});
+t('檔名含「合計」的文件整份略過', () => {
+  setFolder([{ id: 'X', name: '合計表', mime: 'application/vnd.google-apps.document', text: '不要讀我\n內容' }]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items[0].topic, '系統內建說明', '該文件應被略過，退回 /help 内建文案：' + JSON.stringify(items.map(x => x.topic)));
+});
+t('沒設資料夾 ID -> 完全不碰 Drive', () => {
+  setFolder([{ id: 'D1', name: '光明燈操作手冊', mime: 'application/vnd.google-apps.document', text: '送燈時間\n內容' }]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = ""');
+  const prompt = run(`chatSystemPrompt('操作說明', '怎麼登記')`);
+  assert.ok(/使用方式|內建說明/.test(prompt), prompt.slice(0, 200));
+});
+t('優先序：單檔 Doc ID > 資料夾 > 分頁', () => {
+  setFolder([{ id: 'D1', name: '資料夾文件', mime: 'application/vnd.google-apps.document', text: '資料夾主題\n內容' }]);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"; CONFIG.CHAT.MANUAL_DOC_ID = "S1"');
+  ctx.FOLDER.push({ id: 'S1', name: '單一文件', mime: 'application/vnd.google-apps.document', text: '單檔主題\n內容', standalone: true });
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items[0].topic, '單檔主題', JSON.stringify(items));
 });
 
 console.log(`\n結果：${pass} 通過 / ${fail} 失敗`);

@@ -81,7 +81,10 @@ var CONFIG = {
     MODE_TTL: spInt('CHAT_MODE_TTL', 3600),         // 60 分鐘沒動作自動關回沉默模式
     MAX_REPLY_CHARS: spInt('CHAT_MAX_CHARS', 600),  // 回覆字數上限（含標點）
     MANUAL_SHEET: sp('CHAT_MANUAL_SHEET', '操作手冊'),
-    MANUAL_DOC_ID: sp('CHAT_MANUAL_DOC_ID', ''),    // 設了就會走 Google 文件（會多要求 Docs 授權）
+    MANUAL_DOC_ID: sp('CHAT_MANUAL_DOC_ID', ''),    // 單份 Google 文件；設了最優先
+    MANUAL_FOLDER_ID: sp('CHAT_MANUAL_FOLDER_ID', ''),   // 整個 Drive 資料夾內的所有 Google 文件（會多要求 Drive/Docs 授權）
+    MANUAL_MAX_FILES: spInt('CHAT_MANUAL_MAX_FILES', 10),      // 資料夾最多讀幾份文件
+    MANUAL_MAX_ITEMS: spInt('CHAT_MANUAL_MAX_ITEMS', 200),     // 總條目上限，避免 prompt 爆炸
     MANUAL_MAX_CHARS: spInt('CHAT_MANUAL_MAX_CHARS', 4000),
     ROLES: {
       '操作說明': '你是「宮廟光明燈管理系統」的操作小幫手，專門教導經辦人如何用 LINE 登記、修改光明燈規格。' +
@@ -856,6 +859,7 @@ function manualItems() {
   } catch (e) {}
 
   var items = manualFromDoc();
+  if (!items.length) items = manualFromFolder();
   if (!items.length) items = manualFromSheet();
   if (!items.length) items = [{ topic: '系統內建說明', body: handleHelpCommand(), sample: '' }];
 
@@ -878,6 +882,51 @@ function manualFromDoc() {
     return out;
   } catch (e) {
     console.log('讀 Google 文件手冊失敗（通常是沒啟用 DocumentApp 服務或未授權）：' + e.toString());
+    return [];
+  }
+}
+
+// 從 Drive 資料夾讀所有 Google 文件：檔名當來源，段落首行當主題
+function manualFromFolder() {
+  var id = CONFIG.CHAT.MANUAL_FOLDER_ID;
+  if (!id) return [];
+  try {
+    var folder = DriveApp.getFolderById(id);
+    var iter = folder.getFiles(), out = [], n = 0, skipped = [];
+    while (iter.hasNext() && out.length < CONFIG.CHAT.MANUAL_MAX_ITEMS && n < CONFIG.CHAT.MANUAL_MAX_FILES) {
+      var f = iter.next();
+      n++;
+      var mime = String(f.getMimeType() || '');
+      var isDoc = mime === 'application/vnd.google-apps.document';
+      var isText = mime === 'text/plain' || mime === 'text/markdown' || /\.(txt|md|markdown)$/i.test(String(f.getName() || ''));
+      if (!isDoc && !isText) {            // PDF、上傳的 .docx 都讀不到文字，跳過並說明
+        skipped.push(f.getName() + '（' + mime + '）');
+        continue;
+      }
+      var name = String(f.getName() || '').trim();
+      if (/合計|備忘/.test(name)) continue;
+      var text = isDoc ? String(DocumentApp.openById(f.getId()).getBody().getText())
+                       : String(f.getBlob().getDataAsString('UTF-8'));
+      text = text.replace(/^#+\s*/gm, '').replace(/\*\*/g, '').replace(/<br\s*\/?>/gi, '\n');
+      text.split(/\n\s*\n/).forEach(function (para) {
+        var lines = String(para).split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l; });
+        if (!lines.length || out.length >= CONFIG.CHAT.MANUAL_MAX_ITEMS) return;
+        if (/合計|小計|總計/.test(lines[0])) return;
+        out.push({
+          topic: (name ? name + '｜' : '') + lines[0].substring(0, 40),
+          body: lines.join('\n'),
+          sample: ''
+        });
+      });
+    }
+    if (skipped.length) {
+      console.log('⚠️ 資料夾內這些檔案讀不到文字，已略過：' + skipped.join('、') +
+                  '｜支援格式：Google 文件（.docx 請「開啟方式 → Google 文件 → 檔案 → 另存為 Google 文件」）、.txt、.md。PDF 請先轉檔或直接把內容貼成 Google 文件');
+    }
+    if (!out.length) console.log('資料夾內找不到可讀的手冊檔案（請放 Google 文件、.txt 或 .md）');
+    return out;
+  } catch (e) {
+    console.log('讀 Drive 資料夾手冊失敗（未授權或 ID 不對）：' + e.toString());
     return [];
   }
 }
