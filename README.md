@@ -325,7 +325,7 @@ node test/light.test.js
 - 單檔 GAS：執行時間上限 6 分鐘（本系統單次需求 <2 秒）；`PropertiesService` 内容 500KB、`USER_IDENTS` 程式內只保留最近 300 位使用者
 - 同一人 10 秒內連發兩則可能抓到舊草稿（webhook 無鎖），建議逐則送出、收到回覆再傳下一筆
 - LINE 單則文字 5000 字上限；`/help` 約 1036 字，查詢結果超過 12 筆會截斷
-- 檔案後半段 `testAllPermissions`、`testCreateCalendarEvent`、`testCreateContact`、`createGoogleCalendarEvent`、`createGoogleContact`（約 1039~1201 行）是另一專案（教師管家）的殘留，與光明燈無關，但會讓**首次授權多要求 Google 日曆與聯絡人權限**。不需要就直接把那幾支函式整段刪除，不影響本系統
+- 檔案只做「LINE 收單 → 試算表」，需要的授權僅 **Sheets + UrlFetchApp**（Gemini/LINE API）。原本結尾殘留的日曆／聯絡人五支函式（`testAllPermissions`、`testCreateCalendarEvent`、`testCreateContact`、`createGoogleCalendarEvent`、`createGoogleContact`）已移除 —— 它們會讓首次授權多要求 Google 日曆與聯絡人權限，却没有任何流程用到。要「送燈日期自動排進行事曆」請看下一節
 
 ---
 
@@ -342,4 +342,21 @@ node test/light.test.js
 | `3. Gemini 串接` | `analyzeMessageWithGemini()`：prompt 契約、多模型容錯 | **加欄位時必改 prompt** |
 | `4. 核心業務` | `handleDataRouting()` 分流；`doCreate/doUpdate/doRead`；`readData()` 裁寬、`isSummaryRow()`、`matchTemple/matchSpec/normSpec`、`parseDateKey()`、`buildRowValues()`、`renameAgent()`、`setupLightHeader()` | 比對規則與寫入規則 |
 | `5. LINE 工具` | `sendLineReply()` | 改訊息格式/加 Flex Message |
-| `6./9. 其他` | 狀態頁 HTML、`testGeminiProbe()`、`testLineToken()`；9 區為舊專案殘留 | 排錯用測試筆 |
+| `5./6. 其他` | `sendLineReply()`、瀏覽器狀態頁 `doGet()`、排錯筆 `testGeminiProbe()`／`testLineToken()` | 排錯用 |
+
+---
+
+## 10. 可選擴充：送燈日期寫進 Google 日曆
+
+目前**沒有**接日曆（授權只到試算表）。若要「登記後自動在行事曆出現送燈提醒」，需要處理的是這些事，不是加一支 `createEvent` 就好：
+
+| 议题 | 要決定的事 |
+|---|---|
+| 何時建 | 只有 `CREATE` 建？`UPDATE` 改了送燈時間要不要跟著改（需要先記住 event id，否則会在日曆上留舊事件） |
+| 建在哪 | 你的預設日曆，或指定 `CAL_ID`；經辦人要不要共用（共用就要寫入對方的日历權限） |
+| 「前」的語意 | `國10/17前` 是 10/17 當天提醒，還是提前 3 天？`12/10or12/17` 建一筆還是兩筆 |
+| 不建的條件 | `已送燈`、`農曆…`、`待定`（`parseDateKey()` 回空的那些）一律不建，這部分現成可判斷 |
+| 授權 | 會多出 Google 日曆 scope，重新授權時經辦人若自己部署會看到多一項權限要求 |
+| 開關 | 建議 `CAL_SYNC = ON` 才啟用，預設 OFF，避免試機階段產生一堆測試事件 |
+
+要做的话告诉我上面幾格怎么选，我按 TDD 先加測試再實作（`parseDateKey()`、`buildRemark()` 那套標記邏輯可以直接複用當判斷依據）。
