@@ -9,11 +9,14 @@ var CONFIG = {
   // 已自動代入您提供的試算表 ID
   // SPREADSHEET_ID: '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A', 
   GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-3.6-flash',
-  // 登記資料所在的分頁名稱；想換名字就在腳本屬性新增 SHEET_NAME = 你的分頁名（不用改程式）
+  // 登記資料所在的分頁名稱。LIGHT_MGMT 是主表；想換名字就在腳本屬性新增 SHEET_NAME（不用改程式）
+  // 其餘為各承攬商專屬分頁（KEY 用大寫蛇標式，值才是試算表分頁實際名稱）
   SHEET_NAMES: {
     LIGHT_MGMT: (function() {
       try { return String(PropertiesService.getScriptProperties().getProperty('SHEET_NAME') || '光明燈管理').trim(); } catch (e) { return '光明燈管理'; }
-    })()
+    })(),
+    SHENG_WEN: '聖文',   // 聖文訂單分頁
+    MING_DIAN: '明典'    // 明典訂單分頁
   },
 
   // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，正規日期放最右側輔助欄
@@ -25,9 +28,10 @@ var CONFIG = {
     DELIVERY: 5,     // E 送燈日期（原樣文字，例：國10/17前、已送燈）
     SOFTWARE: 6,     // F 軟體（例：廟幫手、冠緯、其他）
     COMPUTER: 7,     // G 電腦（例：研華、廟、研華*3）
-    DATE_KEY: 8      // H 正規日期（辅助排序，YYYY-MM-DD）
+    DATE_KEY: 8,     // H 正規日期（輔助排序，YYYY-MM-DD）
+    REMARK: 9        // I 備註（機器人只在明示時寫；合計/小計公式請從 J 欄開始）
   },
-  HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期'],
+  HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期', '備註'],
   // 喚醒字：訊息開頭必須帶其中一個，系統才會解析與寫入（避免誤觸、也省 Gemini 配額）
   // 可在腳本屬性 WAKE_WORDS 用逗號覆蓋，例：小幫手,光明燈助理
   WAKE_WORDS: (function() {
@@ -56,7 +60,7 @@ var CONFIG = {
   })(),
   FIELD_LABELS: {
     agent: '業務／公司名', temple: '廟宇', spec: '規格', total_count: '總燈數',
-    delivery_text: '送燈日期', software: '軟體', computer: '電腦'
+    delivery_text: '送燈日期', software: '軟體', computer: '電腦', remark: '備註'
   },
   DRAFT_TTL: 600,       // 補件草稿保留秒數（10 分鐘）
   MAX_LIST_ROWS: 12  // 查詢/提示最多列出的筆數
@@ -203,8 +207,9 @@ function clearDraft(userId) {
 }
 
 // 新取得的欄位覆蓋舊草稿（空格不覆蓋）
+// 合併草稿與新取得的欄位（新值優先，空值不覆蓋）；欄位清單直接看 FIELD_LABELS，新增欄位不用改這裡
 function mergeDetails(base, extra) {
-  var out = {}, keys = ['agent', 'temple', 'spec', 'total_count', 'delivery_text', 'software', 'computer'];
+  var out = {}, keys = Object.keys(CONFIG.FIELD_LABELS);
   keys.forEach(function(k) {
     var b = base ? base[k] : null, x = extra ? extra[k] : null;
     out[k] = (x === null || x === undefined || String(x).trim() === '') ? (b === undefined ? null : b) : x;
@@ -485,9 +490,11 @@ function handleHelpCommand() {
     '　 /model <模型名>　切換指定模型',
     '　 /model auto　　　恢復自動模式',
     '',
-    '📋 可辨識欄位：業務｜廟宇｜規格｜總燈數｜送燈日期｜軟體｜電腦',
-    '💡 送燈日期保留您的寫法（國10/17前、12/10or12/17、已送燈），系統只在右側輔助欄另存 YYYY-MM-DD',
-    '💡 合計／小計公式請放最右側欄（I 欄以後），機器人只寫 A~H，絕不動到你的公式',
+    '📋 可辨識欄位：業務｜廟宇｜規格｜總燈數｜送燈日期｜軟體｜電腦｜備註',
+    '　 ✍️ 備註要明確寫「備註：……」才會進 I 欄，例：…500盞 國10/17前 備註：分兩批送',
+    '💡 送燈日期保留您的寫法（國10/17前、12/10or12/17、已送燈），系統只在 H 欄另存國曆 YYYY-MM-DD',
+    '　　・「國」=國曆、「民國115」=西元2026；寫「農曆/舊曆」系統不敢換算，H 欄留空（E 欄仍保留原文）',
+    '💡 合計／小計公式請放最右側欄（J 欄以後），機器人只寫 A~I，絕不動到你的公式',
     '',
     '🔕 回覆規則：只在「新增／修改」與「資料不全需補件」時回訊',
     '　 未帶喚醒字、查詢、閒聊一律不回覆',
@@ -559,24 +566,26 @@ function analyzeMessageWithGemini(text) {
                "   - total_count: 總燈數（必須是純數字，移除千分逗號；「2,112盞」請填 2112）\n" +
                "   - delivery_text: 送燈日期，請「原樣保留」使用者的寫法，包含「國」「前」「or」或「已送燈」等字樣（例：國10/17前、12/10or12/17、國115-02/09前、已送燈）。切勿自行換算成 YYYY-MM-DD。\n" +
                "   - software: 軟體（例：廟幫手、冠緯、家森、冠宇、其他、廟管家）\n" +
-               "   - computer: 電腦／硬體（例：研華、廟、研華*3）\n\n" +
+               "   - computer: 電腦／硬體（例：研華、廟、研華*3）\n" +
+               "   - remark: 備註。只在使用者明確寫出「備註：…」或「另外說明：…」時才填，內容照原樣保留；\n" +
+               "             沒有明示一律填 null，不可把整句登記內容或你自己推測的話寫進備註\n\n"
                "【重要規則】:\n" +
                "A. 使用者常把業務與廟名用「-」「－」「—」連寫（例：「聖文-石岡子乾元宮」），此時「-」之前是 agent，之後是 temple，必須拆開。\n" +
                "B. 「國115/02/09」屬民國年、「國10/17」屬國曆月日，兩者都只是日期寫法差異，原字串照抄進 delivery_text。\n" +
                "C. 同一間廟可能同時有 4*5 與 5*7 兩種規格，因此 spec 是重要的定位欄位，有提到就一定要填。\n" +
                "D. 語意為「查詢/有哪些/帮我查」時 action='READ'；「改成/調整/補登記」時 action='UPDATE'；其餘登記類描述為 'CREATE'。\n\n" +
                "【範例 1：新增（業務與廟名連寫）】:\n" +
-               "輸入:「聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華」\n" +
-               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"聖文\",\"temple\":\"石岡子乾元宮\",\"spec\":\"5*7 OLED琥珀色\",\"total_count\":2112,\"delivery_text\":\"國10/17前\",\"software\":\"其他\",\"computer\":\"研華\"}}\n\n" +
+               "輸入:「聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華 備註：分兩批送，第二批國12/01前」\n" +
+               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"聖文\",\"temple\":\"石岡子乾元宮\",\"spec\":\"5*7 OLED琥珀色\",\"total_count\":2112,\"delivery_text\":\"國10/17前\",\"software\":\"其他\",\"computer\":\"研華\",\"remark\":\"分兩批送，第二批國12/01前\"}}\n\n" +
                "【範例 2：新增（口語敘述）】:\n" +
                "輸入:「業務王小明登記，媽祖廟要新增財神燈500盞，預計10月15送燈」\n" +
-               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"王小明\",\"temple\":\"媽祖廟\",\"spec\":\"財神燈\",\"total_count\":500,\"delivery_text\":\"10月15\",\"software\":null,\"computer\":null}}\n\n" +
+               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"王小明\",\"temple\":\"媽祖廟\",\"spec\":\"財神燈\",\"total_count\":500,\"delivery_text\":\"10月15\",\"software\":null,\"computer\":null,\"remark\":null}}\n\n" +
                "【範例 3：修改】:\n" +
                "輸入:「幫我修改新化武廟 4*5 OLED琥珀色 的總燈數變成5238盞，軟體冠緯、電腦研華」\n" +
-               "輸出: {\"action\":\"UPDATE\",\"details\":{\"agent\":null,\"temple\":\"新化武廟\",\"spec\":\"4*5 OLED琥珀色\",\"total_count\":5238,\"delivery_text\":null,\"software\":\"冠緯\",\"computer\":\"研華\"}}\n\n" +
+               "輸出: {\"action\":\"UPDATE\",\"details\":{\"agent\":null,\"temple\":\"新化武廟\",\"spec\":\"4*5 OLED琥珀色\",\"total_count\":5238,\"delivery_text\":null,\"software\":\"冠緯\",\"computer\":\"研華\",\"remark\":null}}\n\n" +
                "【範例 4：查詢】:\n" +
                "輸入:「查一下金六結福德廟有哪些燈」\n" +
-               "輸出: {\"action\":\"READ\",\"details\":{\"agent\":null,\"temple\":\"金六結福德廟\",\"spec\":null,\"total_count\":null,\"delivery_text\":null,\"software\":null,\"computer\":null}}";
+               "輸出: {\"action\":\"READ\",\"details\":{\"agent\":null,\"temple\":\"金六結福德廟\",\"spec\":null,\"total_count\":null,\"delivery_text\":null,\"software\":null,\"computer\":null,\"remark\":null}}";
 
   var payload = {
     "contents": [{ "parts": [{ "text": prompt }] }],
@@ -653,13 +662,20 @@ function getLightSheet(createIfMissing) {
   return sheet;
 }
 
+// 系統會用到的最右欄索引（新增欄位只改 CONFIG.COLUMNS 就好，不必各處同步）
+function maxColumnIndex() {
+  var max = 0;
+  Object.keys(CONFIG.COLUMNS).forEach(function(k) { max = Math.max(max, CONFIG.COLUMNS[k]); });
+  return max;
+}
+
 function sheetTimeZone() {
   try { return Session.getScriptTimeZone(); } catch (e) { return 'Asia/Taipei'; }
 }
 
 // 資料區（含表頭）；一律裁到 DATE_KEY 寬，右側由使用者自放的合計/公式欄不受影響
 function readData(sheet) {
-  var width = CONFIG.COLUMNS.DATE_KEY;
+  var width = maxColumnIndex();
   var values = sheet.getDataRange().getValues();
   var trimmed = [];
   for (var i = 0; i < values.length; i++) {
@@ -672,7 +688,7 @@ function readData(sheet) {
 
 // 需要的輔助欄（正規日期）若超出目前欄數，先自動補欄避免 getRange 越界
 function ensureColumnWidth(sheet) {
-  var need = CONFIG.COLUMNS.DATE_KEY;
+  var need = maxColumnIndex();
   if (sheet.getMaxColumns() < need) {
     sheet.insertColumnsAfter(sheet.getMaxColumns(), need - sheet.getMaxColumns());
   }
@@ -683,12 +699,56 @@ function ensureColumnWidth(sheet) {
 // 重複執行安全：已有資料不會被清掉，只把第 1 列表頭蓋成同一組名稱
 function setupLightSheet() {
   var sheet = getLightSheet(true);
+  decorateSheet(sheet);
+  var msg = '✅ 主表「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」就緒（唯一寫入端，欄位 A~' +
+            String.fromCharCode(64 + maxColumnIndex()) + '）：' + CONFIG.HEADERS.join(' | ');
+  Logger.log(msg);
+  return msg + '\n' + syncCompanyTabs();
+}
+
+function decorateSheet(sheet) {
   ensureColumnWidth(sheet);
   sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setValues([CONFIG.HEADERS]);
   sheet.setFrozenRows(1);
   try { sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setFontWeight('bold'); } catch (e) {}
-  var msg = '✅ 分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」就緒（欄位 A~' +
-            String.fromCharCode(64 + CONFIG.COLUMNS.DATE_KEY) + '）：' + CONFIG.HEADERS.join(' | ');
+}
+
+// 各承攬商分頁（不含主表）：只讀投影，由主表 QUERY 產生
+function companyTabNames() {
+  var master = CONFIG.SHEET_NAMES.LIGHT_MGMT, out = [];
+  Object.keys(CONFIG.SHEET_NAMES).forEach(function(k) {
+    if (k === 'LIGHT_MGMT') return;
+    var name = String(CONFIG.SHEET_NAMES[k] || '').trim();
+    if (name && name !== master) out.push(name);
+  });
+  return out;
+}
+
+// 建立／更新各公司分頁：表頭 + A2 起自動投影主表資料，並設為「編輯時警告」避免被人手改
+function syncCompanyTabs() {
+  var names = companyTabNames();
+  if (!names.length) return '（未設定公司分頁）';
+  var master = CONFIG.SHEET_NAMES.LIGHT_MGMT, ss = getSpreadsheet(), made = [];
+  var lastCol = String.fromCharCode(64 + maxColumnIndex());          // 目前 9 → I（含備註欄）
+
+  names.forEach(function(name) {
+    var tab = ss.getSheetByName(name) || ss.insertSheet(name);
+    var width = maxColumnIndex();
+    if (tab.getMaxRows() < 30) tab.insertRowsAfter(tab.getMaxRows(), 30 - tab.getMaxRows());
+    tab.getRange(2, 1, Math.max(tab.getMaxRows() - 1, 1), width).clearContent();  // 只清投影區，不動表頭
+    tab.getRange(1, 1, 1, CONFIG.HEADERS.length).setValues([CONFIG.HEADERS]);
+    try { tab.getRange(1, 1, 1, CONFIG.HEADERS.length).setFontWeight('bold'); } catch (e) {}
+    var q = 'where upper(A) contains upper("' + name + '")';
+    tab.getRange(2, 1).setFormula("=QUERY('" + master + "'!A2:" + lastCol + ', "' + q + '", 0)');
+    tab.setFrozenRows(1);
+    try {
+      var prot = tab.protect().setDescription('由主表自動投影，請勿手動編輯');
+      prot.setWarningOnly(true);
+    } catch (e) { console.log('設定保護範圍失敗（不影響投影）：' + e.toString()); }
+    made.push(name);
+  });
+
+  var msg = '🪞 公司分頁已同步：' + made.join('、') + '（只讀投影，資料仍以「' + master + '」為準）';
   Logger.log(msg);
   return msg;
 }
@@ -771,12 +831,15 @@ function parseDateKey(raw) {
     .replace(/日/g, '');
   s = s.replace(/月/g, '/');
   if (/已送燈|已送|已完|送完|已完成/.test(s)) return '';
+  // 農曆（舊曆/陰曆/国曆以外的曆別）不做換算：GAS 沒有農曆對照表，硬推會推出錯的日期
+  if (/農曆|农历|舊曆|旧历|阴历|陰曆|國曆初一|初[一二三四五六七八九十]{1,3}／|^農/.test(s)) return '';
 
   var y = 0, m = 0, d = 0;
+  var ROC_BASE = 1911;  // 民國 115 = 西元 2026、116 = 2027
   var full = s.match(/(?:民國|民|國|西元|公元)?(\d{2,4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
   if (full) {
     y = parseInt(full[1], 10); m = parseInt(full[2], 10); d = parseInt(full[3], 10);
-    if (y < 1911) y += 1911;  // 民國 115 -> 2026
+    if (y < 1900) y += ROC_BASE;  // 115 -> 2026（4 位數一律視為西元）
   } else {
     var md = s.match(/(\d{1,2})\/(\d{1,2})/);
     if (md) {
@@ -801,6 +864,7 @@ function buildRowValues(d) {
   vals[C.SOFTWARE - 1] = d.software || '';
   vals[C.COMPUTER - 1] = d.computer || '';
   vals[C.DATE_KEY - 1] = parseDateKey(d.delivery_text);
+  vals[C.REMARK - 1] = d.remark || '';
   for (var i = 0; i < vals.length; i++) {
     if (vals[i] === undefined) vals[i] = '';
   }
@@ -814,7 +878,8 @@ function formatRecordLine(row, prefix) {
          '    規格：' + (cell(row, C.SPEC) || '未註明') + '｜燈數：' + withComma(cell(row, C.TOTAL)) + ' 盞\n' +
          '    送燈：' + (cell(row, C.DELIVERY) || '未註明') +
          '｜軟體：' + (cell(row, C.SOFTWARE) || '未註明') +
-         '｜電腦：' + (cell(row, C.COMPUTER) || '未註明');
+         '｜電腦：' + (cell(row, C.COMPUTER) || '未註明') +
+         (cell(row, C.REMARK) ? '\n    備註：' + cell(row, C.REMARK) : '');
 }
 
 function handleDataRouting(aiResult, originalText) {
@@ -939,6 +1004,7 @@ function doUpdate(sheet, d, originalText) {
   }
   apply(C.SOFTWARE, '軟體', d.software);
   apply(C.COMPUTER, '電腦', d.computer);
+  apply(C.REMARK, '備註', d.remark);
   apply(C.SPEC, '規格', specChange ? d.spec : null);
 
   var title = "【🟡 修改成功】第 " + r + " 列｜" + (cell(target, C.AGENT) || '未註明') + '－' + (cell(target, C.TEMPLE) || '未註明') +

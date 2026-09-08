@@ -1,10 +1,10 @@
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const SRC = require('path').join(__dirname, '..', 'light.gs');
 
-const HEADER = ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期'];
+const HEADER = ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期', '備註'];
 const SEED = [
   HEADER,
-  ['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 2112, '已送燈', '', '研華', ''],
+  ['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 2112, '已送燈', '', '研華', '', '去年已換 5*7 全彩'],
   ['聖文', '桃園廣盛壇', '5*7 OLED琥珀色', 456, '國10/17前', '其他', '廟', ''],
   ['聖文', '桃園廣盛壇', '7*9 OLED琥珀色', 576, '', '其他', '廟', ''],
   ['甫穎', '仁武保安宮', '5*7 OLED琥珀色', 2475, '國10/22', '甫穎', '廟', ''],
@@ -23,20 +23,26 @@ const SEED = [
   ['合計燈數', '', '', 104487, '', '', '', '']
 ];
 
-let sheetExists = true;
-function makeSheet(rows) {
+function makeSheet(rows, name) {
   const s = {
-    _rows: rows.map(r => r.slice()),
-    _wrote: 0,
+    _name: name || '', _rows: rows.map(r => r.slice()), _wrote: 0, _frozen: 0,
+    _formulas: {},
+    getName() { return s._name; },
     getDataRange() { return { getValues: () => s._rows }; },
     getMaxColumns() { return s._rows.reduce((a, r) => Math.max(a, r.length), 0); },
+    getMaxRows() { return Math.max(s._rows.length, 1); },
     getLastRow() { return s._rows.length; },
     appendRow(v) { s._rows.push(v.slice()); s._wrote++; },
-    insertColumnsAfter() {}, setFrozenRows() {},
+    insertColumnsAfter() {}, insertRowsAfter() {},
+    setFrozenRows(n) { s._frozen = n; },
+    protect() { const s2 = { setDescription: () => s2, setWarningOnly: () => s2 }; s._protected = true; return s2; },
     getRange(r, c, nr, nc) {
       nr = nr || 1; nc = nc || 1;
       return {
-        setFontWeight() { return this; }, setValue(v) {
+        setFontWeight() { return this; },
+        clearContent() { s._cleared = (s._cleared || 0) + 1; return this; },
+        setFormula(f) { s._formulas[r + ',' + c] = f; return this; },
+        setValue(v) {
           while (s._rows.length < r) s._rows.push([]);
           const row = s._rows[r - 1];
           while (row.length < c) row.push('');
@@ -49,19 +55,30 @@ function makeSheet(rows) {
   return s;
 }
 
-let sheet;
+function makeSS(masterName, masterRows) {
+  const tabs = {};
+  const master = makeSheet(masterRows, masterName);
+  tabs[masterName] = master;
+  const ss = {
+    tabs, master,
+    created: [],
+    getSheetByName: n => tabs[n] || null,
+    insertSheet: n => { const t = makeSheet([HEADER.slice()], n); tabs[n] = t; ss.created.push(n); return t; }
+  };
+  return ss;
+}
+
+let ssStub, sheet;
 let cacheStore = {}, sent = [];
 function load() {
-  sheet = makeSheet(SEED);
+  ssStub = makeSS('光明燈管理', SEED);
+  sheet = ssStub.master;
   const props = {};
   const ctx = {
     PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperty: (k, v) => props[k] = v, deleteProperty: k => delete props[k] }) },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => ({ getId: () => 'FAKE' }),
-      openById: () => ({
-        getSheetByName: n => (n === '光明燈管理' && sheetExists ? sheet : null),
-        insertSheet: n => { sheetExists = true; sheet._rows = [HEADER.slice()]; return sheet; }
-      })
+      openById: () => ssStub
     },
     Session: { getScriptTimeZone: () => 'Asia/Taipei' },
     __props: props,
@@ -90,8 +107,10 @@ const ctx = load();
 const run = expr => vm.runInContext(expr, ctx);
 let pass = 0, fail = 0;
 function reset() {
-  sheetExists = true;
+  Object.keys(ssStub.tabs).forEach(k => delete ssStub.tabs[k]);   // 同一個物件，不能整包換掉（閉包會抓到舊的）
+  ssStub.tabs['光明燈管理'] = sheet; ssStub.created = [];
   sheet._rows = SEED.map(r => r.slice()); sheet._wrote = 0;
+  sheet._formulas = {}; sheet._cleared = 0; sheet._protected = false;
   run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false');
   cacheStore = {}; sent = [];
   ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS; run('CONFIG.AGENT_FROM_LINE_PROFILE = false');
@@ -132,7 +151,7 @@ t('強制新增可繞過', () => {
   assert.ok(/新增成功/.test(r), r);
   assert.strictEqual(sheet._rows.length, before + 1);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(JSON.stringify(last), JSON.stringify(['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 300, '國11/20前', '廟幫手', '研華', '2026-11-20']));
+  assert.strictEqual(JSON.stringify(last), JSON.stringify(['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 300, '國11/20前', '廟幫手', '研華', '2026-11-20', '']));
 });
 t('一般新增寫入 8 欄', () => {
   const r = run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: { agent: '冠宇', temple: '行天宮', spec: '5*7 OLED琥珀色', total_count: 880, delivery_text: '國115/02/09前', software: '冠宇', computer: '研華' } })}, "x")`);
@@ -220,11 +239,11 @@ t('每列右側都掛公式欄 -> 查詢筆數不變', () => {
   assert.ok(/共 2 筆/.test(r), r);
   assert.ok(/合計 216 盞/.test(r), r);
 });
-t('右側有公式欄 -> 新增仍只寫 8 欄', () => {
+t('右側有公式欄 -> 新增只寫 A~I 九欄', () => {
   sheet._rows = SEED.map(r => r.concat(['小計', 1]));
   run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: { agent: '冠宇', temple: '寶林宮', spec: '5*7 OLED', total_count: 66, delivery_text: '國11/30前', software: null, computer: null } })}, "x")`);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(last.length, 8, '應只有 8 欄：' + JSON.stringify(last));
+  assert.strictEqual(last.length, 9, '應只有 A~I 九欄：' + JSON.stringify(last));
   assert.strictEqual(last[7], '2026-11-30');
 });
 t('右側有公式欄 -> 修改仍只動指定欄', () => {
@@ -510,19 +529,92 @@ t('業務相符 + 指明分館 -> 只改那一列', () => {
   assert.strictEqual(sheet._rows[16][3], 108, '中和館不應被改');
 });
 
+console.log('\n【備註欄與曆別（國曆/民國/農曆）】');
+t('明示備註才會寫入 I 欄', () => {
+  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '永樂宮', spec: '5*7 OLED', total_count: 88, remark: '分兩批送，第二批國12/01前' }) });
+  post('小幫手 登記 永樂宮 5*7 OLED 88盞 備註：分兩批送，第二批國12/01前');
+  assert.ok(/新增成功/.test(sent[0]), sent[0]);
+  const last = sheet._rows[sheet._rows.length - 1];
+  assert.strictEqual(last[8], '分兩批送，第二批國12/01前', '整列=' + JSON.stringify(last) + '｜回覆=' + sent[0]);
+  assert.strictEqual(last.length, 9);
+});
+t('沒提備註 -> I 欄留空，不拿整句原文亂填', () => {
+  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '樂善宮', spec: '5*7 OLED', total_count: 10 }) });
+  post('小幫手 登記 樂善宮 5*7 OLED 10盞');
+  assert.strictEqual(sheet._rows[sheet._rows.length - 1][8], '');
+});
+t('修改可單獨改備註', () => {
+  const r = run(`handleDataRouting(${JSON.stringify({ action: 'UPDATE', details: D({ temple: '石岡子乾元宮', spec: '5*7', remark: '已改全彩' }) })}, "x")`);
+  assert.ok(/備註：去年已換 5\*7 全彩 → 已改全彩/.test(r), r);
+  assert.strictEqual(sheet._rows[1][8], '已改全彩');
+  assert.strictEqual(sheet._rows[1][3], 2112, '燈數不應被改');
+});
+t('查詢會列出備註', () => {
+  const r = run(`handleDataRouting(${JSON.stringify({ action: 'READ', details: D({ temple: '石岡子乾元宮' }) })}, "x")`);
+  assert.ok(/備註：/.test(r), r);
+});
+t('民國 115/116 -> 西元 2026/2027', () => {
+  assert.strictEqual(run(`parseDateKey("國115/03/15前")`), '2026-03-15');
+  assert.strictEqual(run(`parseDateKey("民國116/01/02")`), '2027-01-02');
+  assert.strictEqual(run(`parseDateKey("西元2027/06/30")`), '2027-06-30');
+});
+t('農曆不換算（H 欄留空，E 欄仍保留原文）', () => {
+  ['', '農10/17', '農曆十月十七', '舊曆11/05', '陰曆12/01前'].forEach(t2 => {
+    assert.strictEqual(run(`parseDateKey(${JSON.stringify(t2)})`), '', '應留空：' + t2);
+  });
+});
+t('纯國曆與只有月日也照舊換算', () => {
+  assert.strictEqual(run(`parseDateKey("國曆10/17前")`), '2026-10-17');
+  assert.strictEqual(run(`parseDateKey("12/25")`), '2026-12-25');
+});
+t('登記一句帶農曆 -> E 欄原樣、H 欄空，不會推出錯日期', () => {
+  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '聖安宮', spec: '5*7 OLED', total_count: 50, delivery_text: '農曆10/17前' }) });
+  post('小幫手 登記 聖安宮 5*7 OLED 50盞 農曆10/17前');
+  const last = sheet._rows[sheet._rows.length - 1];
+  assert.strictEqual(last[4], '農曆10/17前', 'E 欄應保留原寫法：' + JSON.stringify(last));
+  assert.strictEqual(last[7], '', 'H 欄不應亂推：' + last[7]);
+});
+
 console.log('\n【分頁自動建立與提示】');
 t('分頁不存在 -> 錯誤訊息導向 setupLightSheet()', () => {
-  sheetExists = false;
+  delete ssStub.tabs['光明燈管理'];
   ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
   post('小幫手 登記 武勝宮 5*7 OLED 200盞');
   assert.ok(/setupLightSheet/.test(sent[0]), sent[0]);
 });
-t('setupLightSheet() 自動建立分頁並寫 A~H 表頭', () => {
-  sheetExists = false;
+t('setupLightSheet() 自動建立主表 + 同步公司投影頁', () => {
+  delete ssStub.tabs['光明燈管理'];
   const msg = run('setupLightSheet()');
-  assert.ok(/就緒/.test(msg), msg);
-  assert.strictEqual(sheetExists, true, 'insertSheet 應被呼叫');
-  assert.deepStrictEqual(sheet._rows[0], HEADER);
+  assert.ok(/主表「光明燈管理」就緒/.test(msg), msg);
+  assert.ok(/只讀投影/.test(msg), msg);
+  assert.deepStrictEqual(ssStub.created, ['光明燈管理', '聖文', '明典'], '應建立：' + ssStub.created);
+});
+t('公司分頁 = QUERY 投影主表，且主表資料不被碰', () => {
+  run('setupLightSheet()');
+  const sw = ssStub.tabs['聖文'], md = ssStub.tabs['明典'];
+  assert.deepStrictEqual(sw._rows[0], HEADER, '投影頁也要有 A~H 表頭');
+  assert.ok(/^=QUERY\('光明燈管理'!A2:I, "where upper\(A\) contains upper\("聖文"\)", 0\)$/.test(sw._formulas['2,1']), sw._formulas['2,1']);
+  assert.ok(/upper\("明典"\)/.test(md._formulas['2,1']), md._formulas['2,1']);
+  assert.strictEqual(sw._protected, true, '投影頁應設為編輯警告');
+  assert.strictEqual(sheet._rows.length, 18, '主表資料不應被清掉');
+  assert.strictEqual(Object.keys(sheet._formulas).length, 0, '主表不應被寫 QUERY 公式');
+  assert.strictEqual(sw._rows[0].length, 9, '投影頁表頭應含備註欄共 9 欄');
+});
+t('其他家只有主表：不會冒出奇怪分頁', () => {
+  run('setupLightSheet()');
+  assert.strictEqual(Object.keys(ssStub.tabs).sort().join(','), '光明燈管理,明典,聖文');
+  ai({ action: 'CREATE', details: D({ agent: '冠緯', temple: '新旺宮', spec: '5*7 OLED', total_count: 90 }) });
+  post('小幫手 登記 冠緯 新旺宮 5*7 OLED 90盞');
+  assert.ok(/新增成功/.test(sent[0]), sent[0]);
+  assert.ok(/冠緯/.test(sheet._rows[sheet._rows.length - 1][0]), '應寫進主表');
+  assert.deepStrictEqual(ssStub.created, ['聖文', '明典'], '不應為冠緯另開分頁：' + ssStub.created);
+});
+t('SHEET_NAMES 拿掉兩行 -> 投影機制整個不執行', () => {
+  run('CONFIG.SHEET_NAMES = { LIGHT_MGMT: "光明燈管理" }');
+  const msg = run('setupLightSheet()');
+  assert.ok(/未設定公司分頁/.test(msg), msg);
+  assert.strictEqual(ssStub.created.length, 0, '不應建立任何分頁');
+  run('CONFIG.SHEET_NAMES = { LIGHT_MGMT: "光明燈管理", SHENG_WEN: "聖文", MING_DIAN: "明典" }');
 });
 t('SPREADSHEET_ID 沒設 -> 明確報錯', () => {
   run('CONFIG.SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"');
