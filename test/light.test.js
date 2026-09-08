@@ -958,18 +958,18 @@ t('.md 與 .txt 也能讀，並清掉 markdown 符號', () => {
   const items = JSON.parse(run('JSON.stringify(manualItems())'));
   assert.strictEqual(items.length, 2);
   assert.ok(!/#|\*\*/.test(items[0].topic), '主題不該殘留 # 或 **：' + items[0].topic);
-  assert.ok(items[0].body.indexOf('**') === -1, items[0].body);
+  assert.ok(items[0].body.indexOf('**') === -1, items[0].body);   // 粗體符號清掉，內容保留
 });
 t('PDF 與上傳的 .docx 會被跳過（讀不到文字）', () => {
   setFolder([
     { id: 'P1', name: '說明.pdf', mime: 'application/pdf', text: '' },
     { id: 'P2', name: '說明.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', text: '' },
-    { id: 'P3', name: '真的可用', mime: 'application/vnd.google-apps.document', text: '只有這筆可用' }
+    { id: 'P3', name: '真的可用', mime: 'application/vnd.google-apps.document', text: '可用段落\n這一條有內文所以會留下' }
   ]);
   run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"');
   const items = JSON.parse(run('JSON.stringify(manualItems())'));
   assert.strictEqual(items.length, 1, JSON.stringify(items));
-  assert.strictEqual(items[0].topic, '真的可用｜只有這筆可用');
+  assert.strictEqual(items[0].topic, '真的可用｜可用段落');
 });
 t('MANUAL_MAX_FILES 限制讀取的檔案數', () => {
   setFolder([
@@ -999,6 +999,40 @@ t('優先序：單檔 Doc ID > 資料夾 > 分頁', () => {
   ctx.FOLDER.push({ id: 'S1', name: '單一文件', mime: 'application/vnd.google-apps.document', text: '單檔主題\n內容', standalone: true });
   const items = JSON.parse(run('JSON.stringify(manualItems())'));
   assert.strictEqual(items[0].topic, '單檔主題', JSON.stringify(items));
+});
+
+
+console.log('\n【手册文字清理（從網站貼來的 .txt/.md）】');
+const san = t2 => run(`sanitizeManualText(${JSON.stringify(t2)})`);
+t('HTML 標籤與實體被清掉', () => {
+  const out = san('<h2>送燈時間</h2><p>國曆寫&nbsp;「國10/17前」</p><ul><li>農曆不換算</li></ul>');
+  assert.ok(out.indexOf('<') === -1 && out.indexOf('>') === -1, out);
+  assert.ok(/送燈時間/.test(out) && /農曆不換算/.test(out), out);
+});
+t('img 標籤與 base64 圖不進 prompt，只留佔標', () => {
+  const b64 = 'data:image/png;base64,' + 'A'.repeat(4000);
+  const out = san('第一步如下圖 <img src="' + b64 + '" alt="畫面"> 接著打小幫手');
+  assert.ok(out.length < 120, '不該帶著 4000 字 base64：' + out.length);
+  assert.ok(/〔下圖〕|〔圖片〕/.test(out), out);
+  assert.ok(out.indexOf('A'.repeat(50)) === -1, out.slice(0, 80));
+});
+t('markdown 圖片語法同樣處理', () => {
+  const out = san('如圖 ![操作畫面](https://example.com/a.png) 這樣打');
+  assert.ok(/〔圖片〕/.test(out) && out.indexOf('example.com') === -1, out);
+});
+t('多餘空行與連續空白壓縮', () => {
+  const out = san('第一段\n\n\n\n\n第二段   \t  第三段');
+  assert.ok(out.indexOf('\n\n\n') === -1, JSON.stringify(out));
+});
+t('資料夾讀取時同樣會清（端到端）', () => {
+  ctx.FOLDER = [{ id: 'W1', name: '網站產生', mime: 'text/plain',
+    text: '<h2>怎麼登記</h2><p>打「小幫手 廟名 規格 盞數」</p><img src="data:image/png;base64,' + 'B'.repeat(2000) + '">' }];
+  run(`CacheService.getScriptCache().remove('CHATMANUAL')`);
+  run('CONFIG.CHAT.MANUAL_FOLDER_ID = "F1"; CONFIG.CHAT.MANUAL_DOC_ID = ""');
+  const items = JSON.parse(run('JSON.stringify(manualItems())'));
+  assert.strictEqual(items.length, 1, JSON.stringify(items));
+  assert.ok(items[0].topic.indexOf('<') === -1, items[0].topic);
+  assert.ok((items[0].topic + items[0].body).length < 200, '不該含 base64：' + items[0].body.length);
 });
 
 console.log(`\n結果：${pass} 通過 / ${fail} 失敗`);

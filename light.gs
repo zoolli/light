@@ -851,6 +851,57 @@ function clearHistory(userId) {
 }
 
 // ---- 操作手冊：Google 文件 → 「操作手冊」分頁 → /help 內建文案 ----
+// 從網站複製進 .txt/.md 的内容常混著 HTML 標籤、&nbsp; 與 data:image base64，
+// 這些會白白燒掉 prompt 空間、甚至讓模型跟著回答標籤文字，讀進來前先清過一道
+function sanitizeManualText(text) {
+  return String(text || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<img[^>]*>/gi, '〔下圖〕')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?(p|div|li|ul|ol|table|tr|td|th|h[1-6]|b|i|u|span|font|a|section|article)[^>]*>/gi, ' ')
+    .replace(/data:image\/[a-z]+;base64,[A-Za-z0-9+\/=]+/gi, '〔圖片〕')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '〔圖片〕')
+    .replace(/\*\*|__/g, '').replace(/^>\s?/gm, '')   // 粗體/斜體/引用符號去掉，文字保留
+    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/&amp;/gi, '&')
+    .replace(/\t/g, '    ')
+    .replace(/ {3,}/g, '  ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// 手册本文 → 條目陣列。Markdown 以 # 標題行為界（標題＋其後內文＝一條）；
+// 沒有標題的純文字退回「空行分段、段內首行當主題」
+function parseManualText(text, sourceName) {
+  var clean = sanitizeManualText(text);
+  var lines = clean.split('\n');
+  var out = [], onlyTitles = [], cur = null, prefix = sourceName ? String(sourceName) + '｜' : '';
+  // 有 # 標題就只以標題為界；沒標題（Google 文件、純文字）就以空行為界
+  var hasHeading = /(^|\n)#{1,6}\s+\S/.test(clean);
+
+  function flush() {
+    if (!cur) return;
+    cur.body = cur.body.replace(/\n+$/, '').trim();
+    if (/合計|小計|總計/.test(cur.topic)) { cur = null; return; }
+    if (cur.body) out.push(cur);
+    else onlyTitles.push({ topic: cur.topic, body: cur.topic });   // 只有標題（文件大標題、單行內容）先備著
+    cur = null;
+  }
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = String(lines[i]).trim();
+    var h = line.match(/^(#{1,6})\s*(.+)$/);
+    if (h) { flush(); cur = { topic: prefix + h[2].trim().substring(0, 40), body: '' }; continue; }
+    if (!line) { if (!cur) continue; if (!hasHeading) flush(); else cur.body += '\n'; continue; }
+    if (!cur) { cur = { topic: prefix + line.substring(0, 40), body: '' }; continue; }   // 沒有標題：首行當主題
+    cur.body += (cur.body.trim() ? '\n' : '') + line;
+  }
+  flush();
+  if (!out.length) out = onlyTitles.slice(0, CONFIG.CHAT.MANUAL_MAX_ITEMS);   // 全都沒內文時，至少讓標題條目可用
+  return out;
+}
+
 function manualItems() {
   var cacheKey = 'CHATMANUAL';
   try {
@@ -872,21 +923,13 @@ function manualFromDoc() {
   if (!id) return [];
   try {
     var text = String(DocumentApp.openById(id).getBody().getText());
-    var paras = text.split(/\n\s*\n/), out = [];
-    paras.forEach(function (para) {
-      var lines = String(para).split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l; });
-      if (!lines.length) return;
-      if (/合計|小計|總計/.test(lines[0])) return;
-      out.push({ topic: lines[0].substring(0, 40), body: lines.join('\n'), sample: '' });
-    });
-    return out;
+    return parseManualText(text, '');
   } catch (e) {
     console.log('讀 Google 文件手冊失敗（通常是沒啟用 DocumentApp 服務或未授權）：' + e.toString());
     return [];
   }
 }
 
-// 從 Drive 資料夾讀所有 Google 文件：檔名當來源，段落首行當主題
 function manualFromFolder() {
   var id = CONFIG.CHAT.MANUAL_FOLDER_ID;
   if (!id) return [];
@@ -907,16 +950,8 @@ function manualFromFolder() {
       if (/合計|備忘/.test(name)) continue;
       var text = isDoc ? String(DocumentApp.openById(f.getId()).getBody().getText())
                        : String(f.getBlob().getDataAsString('UTF-8'));
-      text = text.replace(/^#+\s*/gm, '').replace(/\*\*/g, '').replace(/<br\s*\/?>/gi, '\n');
-      text.split(/\n\s*\n/).forEach(function (para) {
-        var lines = String(para).split('\n').map(function (l) { return l.trim(); }).filter(function (l) { return l; });
-        if (!lines.length || out.length >= CONFIG.CHAT.MANUAL_MAX_ITEMS) return;
-        if (/合計|小計|總計/.test(lines[0])) return;
-        out.push({
-          topic: (name ? name + '｜' : '') + lines[0].substring(0, 40),
-          body: lines.join('\n'),
-          sample: ''
-        });
+      parseManualText(text, name).forEach(function (it) {
+        if (out.length < CONFIG.CHAT.MANUAL_MAX_ITEMS) out.push(it);
       });
     }
     if (skipped.length) {
@@ -940,7 +975,7 @@ function manualFromSheet() {
       var topic = String(data[i][0] || '').trim(), body = String(data[i][1] || '').trim(), sample = String(data[i][2] || '').trim();
       if (!topic && !body) continue;
       if (/合計|小計|總計/.test(topic)) continue;
-      out.push({ topic: topic, body: body, sample: sample });
+      out.push({ topic: sanitizeManualText(topic), body: sanitizeManualText(body), sample: sanitizeManualText(sample) });
     }
     return out;
   } catch (e) {
