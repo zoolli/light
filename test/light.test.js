@@ -1,15 +1,16 @@
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const SRC = require('path').join(__dirname, '..', 'light.gs');
 
-const HEADER = ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期', '備註'];
+const HEADER = ['業務', '廟宇', '規格', '總燈數', '送燈時間', '軟體', '電腦', '備註'];
+// 與真實分頁一致：A~H 共 8 欄，沒有正規日期輔助欄（國曆日期以〔國…〕標記併入備註）
 const SEED = [
   HEADER,
-  ['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 2112, '已送燈', '', '研華', '', '去年已換 5*7 全彩'],
+  ['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 2112, '已送燈', '', '研華', '去年已換 5*7 全彩'],
   ['聖文', '桃園廣盛壇', '5*7 OLED琥珀色', 456, '國10/17前', '其他', '廟', ''],
   ['聖文', '桃園廣盛壇', '7*9 OLED琥珀色', 576, '', '其他', '廟', ''],
   ['甫穎', '仁武保安宮', '5*7 OLED琥珀色', 2475, '國10/22', '甫穎', '廟', ''],
   ['聖文', '田洋城隍廟', '5*7 OLED琥珀色', 1600, '國11/07前', '廟幫手', '廟', ''],
-  ['士豪', '新化武廟', '4*5 OLED琥珀色', 5238, '國11/15前', '冠緯', '研華', ''],
+  ['聖文', '新化武廟', '4*5 OLED琥珀色', 5238, '國11/15前', '冠緯', '研華', ''],
   ['合計燈數', '', '', 12457, '', '', '', ''],
   ['士豪', '明倫三聖宮', '4*5 OLED', 7920, '12/10or12/17', '廟幫手', '研華', ''],
   ['士豪', '桃園慈護宮', '4*5 OLED', 55484, '國12/31前', '冠緯', '研華*3', ''],
@@ -151,13 +152,13 @@ t('強制新增可繞過', () => {
   assert.ok(/新增成功/.test(r), r);
   assert.strictEqual(sheet._rows.length, before + 1);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(JSON.stringify(last), JSON.stringify(['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 300, '國11/20前', '廟幫手', '研華', '2026-11-20', '']));
+  assert.strictEqual(JSON.stringify(last), JSON.stringify(['聖文', '石岡子乾元宮', '5*7 OLED琥珀色', 300, '國11/20前', '廟幫手', '研華', '〔國2026-11-20〕']));
 });
 t('一般新增寫入 8 欄', () => {
   const r = run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: { agent: '冠宇', temple: '行天宮', spec: '5*7 OLED琥珀色', total_count: 880, delivery_text: '國115/02/09前', software: '冠宇', computer: '研華' } })}, "x")`);
   assert.ok(/新增成功/.test(r), r);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(last[3], 880); assert.strictEqual(last[7], '2026-02-09');
+  assert.strictEqual(last[3], 880); assert.strictEqual(last[7], '〔國2026-02-09〕');
 });
 t('缺廟名與規格時不寫入', () => {
   const before = sheet._rows.length;
@@ -180,7 +181,7 @@ t('指明規格 -> 只改該列', () => {
   assert.strictEqual(row[0], '士豪', '不應動到業務欄：' + JSON.stringify(row));
   assert.strictEqual(row[3], 1500);
   assert.strictEqual(row[4], '國115/03/01前');
-  assert.strictEqual(row[7], '2026-03-01', '輔助日期應同步：' + row[7]);
+  assert.strictEqual(row[7], '〔國2026-03-01〕', '備註應同步國曆標記：' + row[7]);
 });
 t('數值相同 -> 不做更新', () => {
   const r = run(`handleDataRouting(${JSON.stringify({ action: 'UPDATE', details: { agent: null, temple: '新化武廟', spec: '4*5 OLED琥珀色', total_count: 5238, delivery_text: null, software: null, computer: null } })}, "x")`);
@@ -239,14 +240,14 @@ t('每列右側都掛公式欄 -> 查詢筆數不變', () => {
   assert.ok(/共 2 筆/.test(r), r);
   assert.ok(/合計 216 盞/.test(r), r);
 });
-t('右側有公式欄 -> 新增只寫 A~I 九欄', () => {
+t('右側有公式欄 -> 新增只寫 A~H 八欄', () => {
   sheet._rows = SEED.map(r => r.concat(['小計', 1]));
   run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: { agent: '冠宇', temple: '寶林宮', spec: '5*7 OLED', total_count: 66, delivery_text: '國11/30前', software: null, computer: null } })}, "x")`);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(last.length, 9, '應只有 A~I 九欄：' + JSON.stringify(last));
-  assert.strictEqual(last[7], '2026-11-30');
+  assert.strictEqual(last.length, 8, '應只有 A~H 八欄：' + JSON.stringify(last));
+  assert.strictEqual(last[7], '〔國2026-11-30〕');
 });
-t('右側有公式欄 -> 修改仍只動指定欄', () => {
+t('右側有公式欄 -> 修改仍只動 A~H', () => {
   sheet._rows = SEED.map(r => r.concat(['小計', 12457]));
   const r = run(`handleDataRouting(${JSON.stringify({ action: 'UPDATE', details: { agent: null, temple: '田洋城隍廟', spec: '5*7 OLED琥珀色', total_count: 1700, delivery_text: null, software: null, computer: null } })}, "x")`);
   assert.ok(/修改成功/.test(r), r);
@@ -492,13 +493,13 @@ t('dryRun 只預覽不寫入', () => {
   const r = run(`renameAgent("聖文", "聖文企業", true)`);
   assert.strictEqual(sheet._rows.length, 18);
   assert.strictEqual(JSON.stringify(sheet._rows), before, 'dryRun 不應寫入');
-  assert.ok(/共 4 列/.test(r), r);
+  assert.ok(/共 5 列/.test(r), r);
   assert.ok(/第 2 列：聖文 → 聖文企業（石岡子乾元宮）/.test(r), r);
 });
 t('真的改名 -> 4 列更新，合計列不碰', () => {
   const r = run(`renameAgent("聖文", "聖文企業")`);
   assert.ok(/已完成/.test(r), r);
-  [1, 2, 3, 5].forEach(i => assert.strictEqual(sheet._rows[i][0], '聖文企業', '第 ' + (i + 1) + ' 列'));
+  [1, 2, 3, 5, 6].forEach(i => assert.strictEqual(sheet._rows[i][0], '聖文企業', '第 ' + (i + 1) + ' 列'));
   assert.strictEqual(sheet._rows[4][0], '甫穎', '其他人的列不應被改');
   assert.strictEqual(sheet._rows[7][0], '合計燈數', '合計列不應被改');
   assert.strictEqual(sheet._rows[7][3], 12457, '合計數值不應被改');
@@ -529,24 +530,43 @@ t('業務相符 + 指明分館 -> 只改那一列', () => {
   assert.strictEqual(sheet._rows[16][3], 108, '中和館不應被改');
 });
 
+console.log('\n【備註欄組裝 buildRemark / stripDateTag】');
+t('只有日期沒有說明 -> 標記獨存', () => assert.strictEqual(run(`buildRemark(null, '國10/17前')`), '〔國2026-10-17〕'));
+t('有說明 -> 標記置頂、說明照原文', () => assert.strictEqual(run(`buildRemark('分兩批送', '國10/17前')`), '〔國2026-10-17〕 分兩批送'));
+t('重複組裝不會堆疊標記', () => {
+  const once = run(`buildRemark('分兩批送', '國10/17前')`);
+  assert.strictEqual(run(`buildRemark(${JSON.stringify(once)}, '國10/17前')`), once);
+});
+t('換日期 -> 舊標記被替換', () => assert.strictEqual(run(`buildRemark('〔國2026-10-17〕 分兩批送', '國11/05前')`), '〔國2026-11-05〕 分兩批送'));
+t('已送燈/農曆 -> 不插標記，只留說明', () => {
+  assert.strictEqual(run(`buildRemark('改天再確認', '已送燈')`), '改天再確認');
+  assert.strictEqual(run(`buildRemark('改天再確認', '農曆10/17前')`), '改天再確認');
+});
+t('DATE_TAG_IN_REMARK=OFF -> 完全不插標記', () => {
+  run('CONFIG.REMARK_DATE_TAG = false');
+  assert.strictEqual(run(`buildRemark('分兩批送', '國10/17前')`), '分兩批送');
+  run('CONFIG.REMARK_DATE_TAG = true');
+});
+t('說明裡已有同一日期 -> 不重複插', () => assert.strictEqual(run(`buildRemark('國曆2026-10-17 送', '國10/17前')`), '國曆2026-10-17 送'));
+
 console.log('\n【備註欄與曆別（國曆/民國/農曆）】');
-t('明示備註才會寫入 I 欄', () => {
-  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '永樂宮', spec: '5*7 OLED', total_count: 88, remark: '分兩批送，第二批國12/01前' }) });
-  post('小幫手 登記 永樂宮 5*7 OLED 88盞 備註：分兩批送，第二批國12/01前');
+t('明示備註才會寫入 H 欄（並自動前置國曆標記）', () => {
+  ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '永樂宮', spec: '5*7 OLED', total_count: 88, delivery_text: '國11/25前', remark: '分兩批送，第二批國12/01前' }) });
+  post('小幫手 登記 永樂宮 5*7 OLED 88盞 國11/25前 備註：分兩批送，第二批國12/01前');
   assert.ok(/新增成功/.test(sent[0]), sent[0]);
   const last = sheet._rows[sheet._rows.length - 1];
-  assert.strictEqual(last[8], '分兩批送，第二批國12/01前', '整列=' + JSON.stringify(last) + '｜回覆=' + sent[0]);
-  assert.strictEqual(last.length, 9);
+  assert.strictEqual(last[7], '〔國2026-11-25〕 分兩批送，第二批國12/01前', '整列=' + JSON.stringify(last) + '｜回覆=' + sent[0]);
+  assert.strictEqual(last.length, 8);
 });
-t('沒提備註 -> I 欄留空，不拿整句原文亂填', () => {
+t('沒提備註也沒日期 -> H 欄留空，不拿整句原文亂填', () => {
   ai({ action: 'CREATE', details: D({ agent: '聖文', temple: '樂善宮', spec: '5*7 OLED', total_count: 10 }) });
   post('小幫手 登記 樂善宮 5*7 OLED 10盞');
-  assert.strictEqual(sheet._rows[sheet._rows.length - 1][8], '');
+  assert.strictEqual(sheet._rows[sheet._rows.length - 1][7], '');
 });
 t('修改可單獨改備註', () => {
   const r = run(`handleDataRouting(${JSON.stringify({ action: 'UPDATE', details: D({ temple: '石岡子乾元宮', spec: '5*7', remark: '已改全彩' }) })}, "x")`);
   assert.ok(/備註：去年已換 5\*7 全彩 → 已改全彩/.test(r), r);
-  assert.strictEqual(sheet._rows[1][8], '已改全彩');
+  assert.strictEqual(sheet._rows[1][7], '已改全彩');
   assert.strictEqual(sheet._rows[1][3], 2112, '燈數不應被改');
 });
 t('查詢會列出備註', () => {
@@ -572,7 +592,7 @@ t('登記一句帶農曆 -> E 欄原樣、H 欄空，不會推出錯日期', () 
   post('小幫手 登記 聖安宮 5*7 OLED 50盞 農曆10/17前');
   const last = sheet._rows[sheet._rows.length - 1];
   assert.strictEqual(last[4], '農曆10/17前', 'E 欄應保留原寫法：' + JSON.stringify(last));
-  assert.strictEqual(last[7], '', 'H 欄不應亂推：' + last[7]);
+  assert.strictEqual(last[7], '', '備註不應亂推日期：' + last[7]);
 });
 
 console.log('\n【分頁自動建立與提示】');
@@ -593,12 +613,12 @@ t('公司分頁 = QUERY 投影主表，且主表資料不被碰', () => {
   run('setupLightSheet()');
   const sw = ssStub.tabs['聖文'], md = ssStub.tabs['明典'];
   assert.deepStrictEqual(sw._rows[0], HEADER, '投影頁也要有 A~H 表頭');
-  assert.ok(/^=QUERY\('光明燈管理'!A2:I, "where upper\(A\) contains upper\("聖文"\)", 0\)$/.test(sw._formulas['2,1']), sw._formulas['2,1']);
+  assert.ok(/^=QUERY\('光明燈管理'!A2:H, "where upper\(A\) contains upper\("聖文"\)", 0\)$/.test(sw._formulas['2,1']), sw._formulas['2,1']);
   assert.ok(/upper\("明典"\)/.test(md._formulas['2,1']), md._formulas['2,1']);
   assert.strictEqual(sw._protected, true, '投影頁應設為編輯警告');
   assert.strictEqual(sheet._rows.length, 18, '主表資料不應被清掉');
   assert.strictEqual(Object.keys(sheet._formulas).length, 0, '主表不應被寫 QUERY 公式');
-  assert.strictEqual(sw._rows[0].length, 9, '投影頁表頭應含備註欄共 9 欄');
+  assert.strictEqual(sw._rows[0].length, 8, '投影頁表頭應含備註欄共 8 欄');
 });
 t('其他家只有主表：不會冒出奇怪分頁', () => {
   run('setupLightSheet()');

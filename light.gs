@@ -19,7 +19,7 @@ var CONFIG = {
     MING_DIAN: '明典'    // 明典訂單分頁
   },
 
-  // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，正規日期放最右側輔助欄
+  // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，其他資訊一律收進 H 備註欄
   COLUMNS: {
     AGENT: 1,        // A 業務
     TEMPLE: 2,       // B 廟宇（廟方）
@@ -28,10 +28,14 @@ var CONFIG = {
     DELIVERY: 5,     // E 送燈日期（原樣文字，例：國10/17前、已送燈）
     SOFTWARE: 6,     // F 軟體（例：廟幫手、冠緯、其他）
     COMPUTER: 7,     // G 電腦（例：研華、廟、研華*3）
-    DATE_KEY: 8,     // H 正規日期（輔助排序，YYYY-MM-DD）
-    REMARK: 9        // I 備註（機器人只在明示時寫；合計/小計公式請從 J 欄開始）
+    REMARK: 8        // H 備註（其他資訊都放這裡；合計/小計公式請從 I 欄開始）
   },
-  HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期', '備註'],
+  // 沒有独立的正規日期欄：系統推算出的國曆日期以〔國YYYY-MM-DD〕標記併入備註欄
+  HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈時間', '軟體', '電腦', '備註'],
+  // 是否自動把國曆正規日期以〔國…〕標記寫進備註（腳本屬性 DATE_TAG_IN_REMARK=OFF 可關）
+  REMARK_DATE_TAG: (function() {
+    try { return !/^OFF|NO|0|FALSE$/i.test(String(PropertiesService.getScriptProperties().getProperty('DATE_TAG_IN_REMARK') || 'ON')); } catch (e) { return true; }
+  })(),
   // 喚醒字：訊息開頭必須帶其中一個，系統才會解析與寫入（避免誤觸、也省 Gemini 配額）
   // 可在腳本屬性 WAKE_WORDS 用逗號覆蓋，例：小幫手,光明燈助理
   WAKE_WORDS: (function() {
@@ -60,7 +64,7 @@ var CONFIG = {
   })(),
   FIELD_LABELS: {
     agent: '業務／公司名', temple: '廟宇', spec: '規格', total_count: '總燈數',
-    delivery_text: '送燈日期', software: '軟體', computer: '電腦', remark: '備註'
+    delivery_text: '送燈時間', software: '軟體', computer: '電腦', remark: '備註'
   },
   DRAFT_TTL: 600,       // 補件草稿保留秒數（10 分鐘）
   MAX_LIST_ROWS: 12  // 查詢/提示最多列出的筆數
@@ -470,7 +474,7 @@ function handleHelpCommand() {
     '　 例：' + wake + ' 我要登記，媽祖廟新增財神燈500盞，業務王小明',
     '　 ⚠️ 必填欄位缺任何一項都不會上表，我會回覆「還需要什麼」格式',
     '　 👤 業務預設＝' + (CONFIG.DEFAULT_AGENT || '（未設定，會回問）') + '；沒特別寫就上這個名字',
-    '　 👤 想固定用自己公司名：綁定一次即可蓋掉預設（' + wake + ' 我是聖文）：',
+    '　 👤 想固定用自己公司名：綁定一次就蓋掉預設（' + wake + ' 我是名典）：',
     '　　　 例：' + wake + ' 我是聖文　／　' + wake + ' 我公司 亞盛燈業 我叫 李小華',
     '　　　 綁兩段時業務欄顯示「亞盛燈業-李小華」；換人或換公司再傳一次蓋掉',
     '　 👤 單筆想填別家：直接寫在句首，例：' + wake + ' 甫穎-仁武保安宮 ...',
@@ -490,11 +494,12 @@ function handleHelpCommand() {
     '　 /model <模型名>　切換指定模型',
     '　 /model auto　　　恢復自動模式',
     '',
-    '📋 可辨識欄位：業務｜廟宇｜規格｜總燈數｜送燈日期｜軟體｜電腦｜備註',
-    '　 ✍️ 備註要明確寫「備註：……」才會進 I 欄，例：…500盞 國10/17前 備註：分兩批送',
-    '💡 送燈日期保留您的寫法（國10/17前、12/10or12/17、已送燈），系統只在 H 欄另存國曆 YYYY-MM-DD',
-    '　　・「國」=國曆、「民國115」=西元2026；寫「農曆/舊曆」系統不敢換算，H 欄留空（E 欄仍保留原文）',
-    '💡 合計／小計公式請放最右側欄（J 欄以後），機器人只寫 A~I，絕不動到你的公式',
+    '📋 可辨識欄位：業務｜廟宇｜規格｜總燈數｜送燈時間｜軟體｜電腦｜備註',
+    '　 ✍️ 其他資訊都放備註欄：明確寫「備註：……」才會進 H 欄，例：…500盞 國10/17前 備註：分兩批送',
+    '💡 送燈時間保留您的寫法（國10/17前、12/10or12/17、已送燈），系統不改寫 E 欄',
+    '　　・「國」=國曆、「民國115」=西元2026；寫「農曆/舊曆」系統不敢換算',
+    '　　・推得出的國曆日期會以〔國2026-10-17〕標記自動併進備註欄（關掉：腳本屬性 DATE_TAG_IN_REMARK=OFF）',
+    '💡 合計／小計公式請放最右側欄（I 欄以後），機器人只寫 A~H，絕不動到你的公式',
     '',
     '🔕 回覆規則：只在「新增／修改」與「資料不全需補件」時回訊',
     '　 未帶喚醒字、查詢、閒聊一律不回覆',
@@ -673,7 +678,7 @@ function sheetTimeZone() {
   try { return Session.getScriptTimeZone(); } catch (e) { return 'Asia/Taipei'; }
 }
 
-// 資料區（含表頭）；一律裁到 DATE_KEY 寬，右側由使用者自放的合計/公式欄不受影響
+// 資料區（含表頭）；一律裁到系統管理的欄寬（目前 A~H），右側由使用者自放的合計/公式欄不受影響
 function readData(sheet) {
   var width = maxColumnIndex();
   var values = sheet.getDataRange().getValues();
@@ -686,7 +691,7 @@ function readData(sheet) {
   return trimmed;
 }
 
-// 需要的輔助欄（正規日期）若超出目前欄數，先自動補欄避免 getRange 越界
+// 系統管理的欄寬（A~H）若超過現有欄數，先自動補欄避免 getRange 越界
 function ensureColumnWidth(sheet) {
   var need = maxColumnIndex();
   if (sheet.getMaxColumns() < need) {
@@ -852,7 +857,23 @@ function parseDateKey(raw) {
   try { return Utilities.formatDate(dt, sheetTimeZone(), 'yyyy-MM-dd'); } catch (e) { return y + '-' + m + '-' + d; }
 }
 
-// 依 details 組出一列寫入值（依照 CONFIG.COLUMNS 索引摆放，可補洞）
+var DATE_TAG_RE = /[〔\[]\s*國\s*[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}\s*[〕\]]\s*[，,、\s]*/g;
+
+// 拿掉備註裡系統自動加的〔國…〕標記，避免重複堆疊
+function stripDateTag(text) {
+  return String(text === null || text === undefined ? '' : text).replace(DATE_TAG_RE, '').replace(/^[，,、\s]+/, '').trim();
+}
+
+// 備註欄 = 使用者的說明 + 系統推的國曆標記（放在最前面方便篩選）
+function buildRemark(userRemark, deliveryText) {
+  var note = stripDateTag(userRemark);
+  if (!CONFIG.REMARK_DATE_TAG) return note;
+  var iso = parseDateKey(deliveryText);
+  if (!iso) return note;
+  return note.indexOf(iso) !== -1 ? note : '〔國' + iso + '〕' + (note ? (note.charAt(0) === '，' || note.charAt(0) === '、' ? '' : ' ') + note : '');
+}
+
+// 依 details 組出一列寫入值（依照 CONFIG.COLUMNS 索引擺放，可補洞）
 function buildRowValues(d) {
   var C = CONFIG.COLUMNS;
   var vals = [];
@@ -861,10 +882,10 @@ function buildRowValues(d) {
   vals[C.SPEC - 1] = d.spec || '';
   vals[C.TOTAL - 1] = toNumber(d.total_count);
   vals[C.DELIVERY - 1] = d.delivery_text || '';
+  vals[C.REMARK - 1] = buildRemark(d.remark, d.delivery_text);
   vals[C.SOFTWARE - 1] = d.software || '';
   vals[C.COMPUTER - 1] = d.computer || '';
-  vals[C.DATE_KEY - 1] = parseDateKey(d.delivery_text);
-  vals[C.REMARK - 1] = d.remark || '';
+
   for (var i = 0; i < vals.length; i++) {
     if (vals[i] === undefined) vals[i] = '';
   }
@@ -998,13 +1019,16 @@ function doUpdate(sheet, d, originalText) {
 
   apply(C.AGENT, '業務', d.agent);
   apply(C.TOTAL, '總燈數', d.total_count ? toNumber(d.total_count) : null, { fmt: withComma, unit: ' 盞' });
-  if (d.delivery_text) {
-    apply(C.DELIVERY, '送燈日期', d.delivery_text);
-    apply(C.DATE_KEY, '正規日期', parseDateKey(d.delivery_text));
+  if (d.delivery_text) apply(C.DELIVERY, '送燈時間', d.delivery_text);
+  if (d.delivery_text || d.remark) {
+    var nextDelivery = d.delivery_text || cell(target, C.DELIVERY);
+    var nextRemark = d.remark !== null && d.remark !== undefined && String(d.remark).trim() !== ''
+      ? d.remark : stripDateTag(cell(target, C.REMARK));
+    apply(C.REMARK, '備註', buildRemark(nextRemark, nextDelivery));
   }
   apply(C.SOFTWARE, '軟體', d.software);
   apply(C.COMPUTER, '電腦', d.computer);
-  apply(C.REMARK, '備註', d.remark);
+
   apply(C.SPEC, '規格', specChange ? d.spec : null);
 
   var title = "【🟡 修改成功】第 " + r + " 列｜" + (cell(target, C.AGENT) || '未註明') + '－' + (cell(target, C.TEMPLE) || '未註明') +
