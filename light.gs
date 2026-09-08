@@ -1,0 +1,1202 @@
+// ==================== 1. 光明燈規格管理設定區 ====================
+var CONFIG = {
+  // LINE 與 Gemini 的金鑰，建議在 GAS 的「專案設定 > 腳本屬性」中新增
+  // 如果想先測試，也可以直接把引號內的文字改成您的 Token / API Key 文字
+  LINE_ACCESS_TOKEN: PropertiesService.getScriptProperties().getProperty('LINE_ACCESS_TOKEN') || 'YOUR_LINE_ACCESS_TOKEN',
+  GEMINI_API_KEY: PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') || 'YOUR_GEMINI_API_KEY',
+  SPREADSHEET_ID: PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || (function(){ try { return SpreadsheetApp.getActiveSpreadsheet().getId(); } catch(e) { return '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A'; } })(),
+  
+  // 已自動代入您提供的試算表 ID
+  // SPREADSHEET_ID: '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A', 
+  GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-3.6-flash',
+  SHEET_NAMES: {
+    LIGHT_MGMT: '光明燈管理'  // 請確保您的試算表分頁名稱叫做「光明燈管理」
+  },
+
+  // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，正規日期放最右側輔助欄
+  COLUMNS: {
+    AGENT: 1,        // A 業務
+    TEMPLE: 2,       // B 廟宇（廟方）
+    SPEC: 3,         // C 規格（例：5*7 OLED琥珀色）
+    TOTAL: 4,        // D 總燈數
+    DELIVERY: 5,     // E 送燈日期（原樣文字，例：國10/17前、已送燈）
+    SOFTWARE: 6,     // F 軟體（例：廟幫手、冠緯、其他）
+    COMPUTER: 7,     // G 電腦（例：研華、廟、研華*3）
+    DATE_KEY: 8      // H 正規日期（辅助排序，YYYY-MM-DD）
+  },
+  HEADERS: ['業務', '廟宇', '規格', '總燈數', '送燈日期', '軟體', '電腦', '正規日期'],
+  // 喚醒字：訊息開頭必須帶其中一個，系統才會解析與寫入（避免誤觸、也省 Gemini 配額）
+  // 可在腳本屬性 WAKE_WORDS 用逗號覆蓋，例：小幫手,光明燈助理
+  WAKE_WORDS: (function() {
+    try {
+      var w = PropertiesService.getScriptProperties().getProperty('WAKE_WORDS');
+      if (w) return w.split(/[,，]/).map(function(x) { return x.trim(); }).filter(function(x) { return x; });
+    } catch (e) {}
+    return ['小幫手', '小帮', '幫手', '助理'];
+  })(),
+  // 新增登記的必填欄位：缺任何一個就先請對方補，不會寫進試算表
+  REQUIRED_FIELDS: ['agent', 'temple', 'spec', 'total_count'],
+  // 沒寫業務時，是否自動讀 LINE 暱稱補上。預設 OFF：暱稱常是個人綽號，會蓋掉公司名稱
+  // 需要時在腳本屬性新增 AGENT_FROM_LINE_PROFILE = ON 開啟
+  AGENT_FROM_LINE_PROFILE: (function() {
+    try { return /^(ON|YES|1|TRUE)$/i.test(String(PropertiesService.getScriptProperties().getProperty('AGENT_FROM_LINE_PROFILE') || '')); } catch (e) { return false; }
+  })(),
+  FIELD_LABELS: {
+    agent: '業務／公司名', temple: '廟宇', spec: '規格', total_count: '總燈數',
+    delivery_text: '送燈日期', software: '軟體', computer: '電腦'
+  },
+  DRAFT_TTL: 600,       // 補件草稿保留秒數（10 分鐘）
+  MAX_LIST_ROWS: 12  // 查詢/提示最多列出的筆數
+};
+
+// ==================== 2. LINE Webhook 接收端（網頁回應優化版） ====================
+function doPost(e) {
+  try {
+    // 防禦機制：若完全無資料傳入（例如直接對該網址發送空 POST），回傳一個簡易網頁畫面
+    if (!e || !e.postData || !e.postData.contents) {
+      return HtmlService.createHtmlOutput("<html><body style='font-family:sans-serif; text-align:center; padding-top:50px;'><h2>⛩️ 光明燈系統後端 Webhook</h2><p style='color:green;'>API 介面運作正常，請由 LINE 端傳送資料。</p></body></html>");
+    }
+
+    // 解析 LINE 傳來的 JSON 資料
+    var jsonData = JSON.parse(e.postData.contents);
+    var event = jsonData.events;
+    
+    // LINE 後台點選「Verify」驗證時的空測試包防禦
+    if (!event || event.length === 0) {
+      return HtmlService.createHtmlOutput("<html><body><h1>LINE Webhook Verified Successfully!</h1></body></html>");
+    }
+    
+    var firstEvent = event[0]; // 取出第一筆事件
+    
+    // 檢查是否為文字訊息，若符合才啟動 Gemini AI 與試算表寫入
+    if (firstEvent && firstEvent.replyToken && firstEvent.type === 'message' && firstEvent.message.type === 'text') {
+      var replyToken = firstEvent.replyToken;
+      var userMessage = firstEvent.message.text;
+      var userId = (firstEvent.source && firstEvent.source.userId) || 'unknown-user';
+      var draft = loadDraft(userId);
+
+      // 回覆策略：需要帶喚醒字（或在補件期間）才處理；查詢與不相關訊息保持沉默
+      var flow = decideFlow(userMessage, !!draft);
+
+      if (flow.mode === 'silent') {
+        console.log('🔇 不回覆（' + flow.reason + '）：' + userMessage);
+      } else if (flow.mode === 'command') {
+        sendLineReply(replyToken, flow.handler === 'help' ? handleHelpCommand() : handleModelCommand(userMessage));
+      } else if (flow.mode === 'empty') {
+        // 只打了喚醒字：有草稿就提醒還缺什麼，否則回使用說明
+        sendLineReply(replyToken, draft ? askMissingMessage(missingRequired(draft.details), draft.details) : handleHelpCommand());
+      } else {
+        var bodyText = flow.text;
+        var idtCmd = parseIdentityCommand(bodyText);
+
+        if (idtCmd) {
+          clearDraft(userId);
+          var label = bindIdentity(userId, idtCmd);
+          sendLineReply(replyToken, '✅ 已記住您的業務身分：「' + label + '」\n之後登記不用每次都寫業務，未填時我就自動帶入。\n・公司派來的窗口：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 我公司 亞盛燈業 我叫 李小華 → 顯示「亞盛燈業-李小華」\n・換公司／離職：再傳一次即可蓋掉（例：' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' 我是 聖文）');
+        } else {
+          var aiInput = draft ? (draft.raw + '；補充：' + bodyText) : bodyText;
+          var aiResult = analyzeMessageWithGemini(aiInput);
+          var act = String((aiResult && aiResult.action) || '').toUpperCase();
+
+          if (act === 'CREATE') {
+            var merged = mergeDetails(draft ? draft.details : null, aiResult.details);
+            var agentNote = '';
+            if (String(merged.agent || '').trim() === '') {
+              var idt = getUserIdentity(userId);
+              if (idt.name) {
+                merged.agent = idt.name;
+                agentNote = idt.source === 'bind'
+                  ? '\n👤 業務自動帶入：' + idt.name + '（要換人/換公司：傳「我是 ○○」或「我公司 ○○ 我叫 ○○」）'
+                  : '\n👤 業務自動帶入 LINE 暱稱「' + idt.name + '」，若應填公司名稱請傳「我公司 您的公司名」修正。';
+              }
+            }
+            var miss = missingRequired(merged);
+            if (miss.length > 0 && !/直接新增|強制新增|先佔位/.test(bodyText)) {
+              saveDraft(userId, { raw: draft ? (draft.raw + '；' + bodyText) : bodyText, details: merged });
+              sendLineReply(replyToken, askMissingMessage(miss, merged));
+            } else {
+              clearDraft(userId);
+              sendLineReply(replyToken, handleDataRouting({ action: 'CREATE', details: merged }, aiInput) + agentNote);
+            }
+          } else if (!shouldReplyFor(act)) {
+            console.log('🔇 不回覆（AI 判定意圖 ' + (act || '未知') + '，非新增/修改）：' + bodyText);
+          } else {
+            if (draft) clearDraft(userId);
+            sendLineReply(replyToken, handleDataRouting(aiResult, aiInput));
+          }
+        }
+      }
+    }
+    
+  } catch (error) {
+    console.error('doPost 發生錯誤: ' + error.toString());
+    // 只有「使用者本來就期望有回應」的訊息（指令或寫入類）才打擾；沉默類只留日誌
+    try {
+      var errEvent = JSON.parse(e.postData.contents).events[0];
+      var errText = (errEvent && errEvent.message && errEvent.message.text) || '';
+      var errUid = (errEvent && errEvent.source && errEvent.source.userId) || 'unknown-user';
+      if (errEvent && errEvent.replyToken && decideFlow(errText, !!loadDraft(errUid)).mode !== 'silent') {
+        sendLineReply(errEvent.replyToken, "【⚠️ 系統異常】" + error.toString());
+      }
+    } catch (e2) {}
+  }
+  
+  // 最終一定要回傳 HtmlOutput，確保 LINE 伺服器拿到 HTTP 200 成功狀態代碼
+  return HtmlService.createHtmlOutput("OK");
+}
+
+// ==================== 2.3 喚醒字與補件草稿 ====================
+// 回傳「去掉喚醒字後的內容」；完全找不到喚醒字則回傳 null
+function stripWakeWord(text) {
+  var t = String(text || '').trim();
+  var words = (CONFIG.WAKE_WORDS || []).slice().sort(function(a, b) { return String(b).length - String(a).length; });
+  var i, w, cut = /^[\s,，。、:：；;！!？?～~-]+/;
+  for (i = 0; i < words.length; i++) {
+    w = String(words[i] || '').trim();
+    if (w && t.substring(0, w.length) === w) return t.substring(w.length).replace(cut, '').trim();
+  }
+  for (i = 0; i < words.length; i++) {
+    w = String(words[i] || '').trim();
+    var pos = w ? t.indexOf(w) : -1;
+    if (pos > 0 && pos <= 8) return (t.substring(0, pos) + ' ' + t.substring(pos + w.length)).replace(cut, '').trim();
+  }
+  return null;
+}
+
+function hasWakeWord(text) {
+  return stripWakeWord(text) !== null;
+}
+
+function draftKey(userId) { return 'LIGHTDRAFT_' + userId; }
+
+function loadDraft(userId) {
+  try {
+    var c = CacheService.getScriptCache().get(draftKey(userId));
+    if (c) return JSON.parse(c);
+  } catch (e) {}
+  return null;
+}
+
+function saveDraft(userId, obj) {
+  try { CacheService.getScriptCache().put(draftKey(userId), JSON.stringify(obj), CONFIG.DRAFT_TTL); } catch (e) {}
+}
+
+function clearDraft(userId) {
+  try { CacheService.getScriptCache().remove(draftKey(userId)); } catch (e) {}
+}
+
+// 新取得的欄位覆蓋舊草稿（空格不覆蓋）
+function mergeDetails(base, extra) {
+  var out = {}, keys = ['agent', 'temple', 'spec', 'total_count', 'delivery_text', 'software', 'computer'];
+  keys.forEach(function(k) {
+    var b = base ? base[k] : null, x = extra ? extra[k] : null;
+    out[k] = (x === null || x === undefined || String(x).trim() === '') ? (b === undefined ? null : b) : x;
+  });
+  return out;
+}
+
+function missingRequired(details) {
+  var miss = [];
+  (CONFIG.REQUIRED_FIELDS || []).forEach(function(k) {
+    var v = details ? details[k] : null;
+    if (v === null || v === undefined || String(v).trim() === '') miss.push(k);
+  });
+  return miss;
+}
+
+var FIELD_PLACEHOLDERS = {
+  agent: '聖文', temple: '石岡子乾元宮', spec: '5*7 OLED琥珀色', total_count: '2112盞',
+  delivery_text: '國10/17前', software: '廟幫手', computer: '研華'
+};
+
+function askMissingMessage(miss, details) {
+  var L = CONFIG.FIELD_LABELS;
+  var got = [];
+  Object.keys(L).forEach(function(k) {
+    var v = details ? details[k] : null;
+    if (v !== null && v !== undefined && String(v).trim() !== '') got.push(L[k] + ' ' + v);
+  });
+  var example = (CONFIG.WAKE_WORDS[0] || '小幫手') + ' ' +
+    miss.map(function(k) { return FIELD_PLACEHOLDERS[k] || L[k]; }).join(' ');
+  var lines = [
+    '【🟡 資料還沒齊全，暫未登記】',
+    '📥 已收到：' + (got.length ? got.join('、') : '（無）'),
+    '❓ 還需要：' + miss.map(function(k) { return L[k]; }).join('、'),
+    '',
+    '✍️ 可以直接補：' + example
+  ];
+  if (miss.indexOf('agent') !== -1) lines.push('　（業務只需綁定一次：「我是 聖文」或「我公司 亞盛燈業 我叫 李小華」）');
+  lines.push('⏳ ' + Math.round(CONFIG.DRAFT_TTL / 60) + ' 分鐘內補件我會自動合併，不必重打整串；' +
+             '若想先佔位之後再補，請加「直接新增」');
+  return lines.join('\n');
+}
+
+// ==================== 2.35 業務身分綁定（公司／派來的人員）與 LINE 姓名 ====================
+// 業務欄可能填：自家業務名、公司名、或公司派來的窗口。因此身分拆成 company + person 兩段，
+// 寫進試算表時顯示為「公司-人員」（只有一段時就只顯示那一段）。
+var IDENTITY_KEY = 'USER_IDENTS';
+var PERSON_KEYS = { '窗口': 1, '人員': 1, '我叫': 1, '名字叫': 1, '姓名': 1, '經辦人': 1 };
+
+function readIdentities() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(IDENTITY_KEY) || '{}'); } catch (e) { return {}; }
+}
+
+function identityLabel(idt) {
+  if (!idt) return '';
+  var c = String(idt.company || '').trim(), pe = String(idt.person || '').trim();
+  if (c && pe) return c + '-' + pe;
+  return c || pe || String(idt.label || '').trim();
+}
+
+function saveIdentity(userId, idt) {
+  var map = readIdentities();
+  map[userId] = idt;
+  var keys = Object.keys(map);
+  if (keys.length > 300) keys.slice(0, keys.length - 300).forEach(function(k) { delete map[k]; });
+  try { PropertiesService.getScriptProperties().setProperty(IDENTITY_KEY, JSON.stringify(map)); } catch (e) {}
+  var label = identityLabel(idt);
+  try { CacheService.getScriptCache().put('ULN_' + userId, JSON.stringify({ name: label, source: 'bind' }), 86400 * 7); } catch (e) {}
+  return label;
+}
+
+function bindIdentity(userId, patch) {
+  var cur = readIdentities()[userId] || {};
+  var idt = { company: cur.company || '', person: cur.person || '' };
+  if (patch.company) idt.company = patch.company;
+  if (patch.person) idt.person = patch.person;
+  return saveIdentity(userId, idt);
+}
+
+var IDT_BAD = /登記|新增|修改|改成|改為|送燈|安奉|軟體|電腦|總燈數|\d+\s*盞|\d\s*[*×xX]\s*\d|OLED|LED/i;
+var IDT_RE = /(我的公司|我公司|公司名稱|公司|廠商|業務窗口|業務|經辦人|經辦|窗口|人員|姓名|名字叫|我叫|我是)(?:名稱)?\s*[:：]?\s*([^\s，,、；;:：]{1,20})/g;
+
+// 解析「我公司 亞盛燈業 我叫 李小華」「我是 亞盛燈業 的 李小華」「我是聖文」等寫法
+// 回傳 {company, person}；若這句看起來像登記內容（有殘字或含燈位關鍵字）則回傳 null
+function parseIdentityCommand(text) {
+  var t = String(text || '').trim();
+  if (!t || t.length > 44) return null;
+
+  var both = t.match(/^(?:我是|我叫)?\s*(.{1,20}?)\s*的\s*(.{1,20})$/);
+  if (both && !IDT_BAD.test(both[1] + both[2]) && !/\s/.test(both[1] + both[2])) {
+    return { company: both[1].trim(), person: both[2].trim() };
+  }
+
+  var res = {}, rest = t, hit = 0, re, m;
+  IDT_RE.lastIndex = 0;
+  var pieces = [];
+  while ((m = IDT_RE.exec(t)) !== null) {
+    var key = m[1], val = m[2].trim();
+    if (IDT_BAD.test(val)) return null;
+    if (PERSON_KEYS[key]) res.person = val; else res.company = val;
+    pieces.push(m[0]);
+    hit++;
+  }
+  if (!hit) return null;
+
+  rest = t;
+  pieces.forEach(function(seg) { rest = rest.replace(seg, ''); });
+  rest = rest.replace(/[\s，,、；;:：]+/g, '');
+  if (rest.length > 0) return null;   // 句子上還有別的內容 → 比較像是登記，不當身分綁定處理
+  return res;
+}
+
+// 回傳該 LINE 使用者要帶入的業務欄文字（来源：綁定 > LINE 暱稱）
+function getUserIdentity(userId) {
+  var uid = String(userId || '');
+  var bound = readIdentities()[uid];
+  var label = identityLabel(bound);
+  if (label) return { name: label, source: 'bind' };
+  if (!uid || CONFIG.AGENT_FROM_LINE_PROFILE === false) return { name: '', source: 'none' };
+
+  var ck = 'ULN_' + uid;
+  try {
+    var c = CacheService.getScriptCache().get(ck);
+    if (c) { var j = JSON.parse(c); return { name: j.name || '', source: j.source || 'line' }; }
+  } catch (e) {}
+  var nick = fetchLineDisplayName(uid);
+  try { CacheService.getScriptCache().put(ck, JSON.stringify({ name: nick, source: nick ? 'line' : 'none' }), 86400 * 3); } catch (e) {}
+  return { name: nick, source: nick ? 'line' : 'none' };
+}
+
+function fetchLineDisplayName(userId) {
+  try {
+    var resp = UrlFetchApp.fetch('https://api.line.me/v2/bot/profile/' + userId, {
+      headers: { 'Authorization': 'Bearer ' + CONFIG.LINE_ACCESS_TOKEN, 'Content-Type': 'application/json' },
+      muteHttpExceptions: true
+    });
+    if (resp.getResponseCode() !== 200) {
+      console.log('🔇 取得 LINE 姓名失敗 HTTP ' + resp.getResponseCode() + '（未加好友／未同意授權／已封鎖）');
+      return '';
+    }
+    return String(JSON.parse(resp.getContentText()).displayName || '').trim();
+  } catch (e) {
+    console.error('fetchLineDisplayName 異常: ' + e.toString());
+    return '';
+  }
+}
+
+// ==================== 2.4 回覆策略（只回「會動到資料」的訊息） ====================
+// 腳本屬性 REPLY_MODE = ALL 可恢復「全部回覆」（含查詢與 AI 判定為 READ 的訊息）
+function isReplyAllMode() {
+  try {
+    var v = PropertiesService.getScriptProperties().getProperty('REPLY_MODE') || '';
+    return /^(ALL|全部|所有|ON)$/i.test(String(v).trim());
+  } catch (e) { return false; }
+}
+
+// 查詢類語氣（不含寫入動詞）：這種訊息不需要打扰使用者，也不需要花 Gemini 配額
+function isReadOnlyAsking(text) {
+  var t = String(text || '');
+  var query = /查詢|查一下|查查看|幫我查|帮我查|有哪些|有幾盞|有幾種|幾盞|多少盞|總共|共計|列出|列一下|清單|統計|回報|查無|查一下/;
+  var write = /新增|登記|補一筆|修改|改成|改為|換成|調整|送燈|安奉|強制新增|异动|異動/;
+  return query.test(t) && !write.test(t);
+}
+
+// 與燈位資料無關的閒聊／雜訊（天氣、問候、語音轉文字的無關內容）
+function looksLikeLightData(text) {
+  var t = String(text || '');
+  if (/盞|燈|廟|宮|壇|殿|祠|寺|庵|堂|光明|太歲|文昌|財神|月老|觀音|神尊|城隍|媽祖|聖母|福德|土地公|關帝|帝君|王爺|祖師|保生|玄天|立燈/.test(t)) return true;
+  if (/登記|新增|修改|改成|改為|換成|調整|補一筆|安奉|業務|經辦|軟體|電腦/.test(t)) return true;
+  if (/OLED|LED|研華|廟幫手|廟管家/i.test(t)) return true;
+  if (/\d{1,2}\s*[*×xX＊]\s*\d{1,2}/.test(t)) return true;  // 5*7 / 4*5 這類規格寫法
+  if (/[\u4e00-\u9fa5]{2,6}\s*[-－—]\s*[\u4e00-\u9fa5]{2,20}/.test(t) && /\d/.test(t)) return true;  // 「聖文-石岡子乾元宮 ... 2112」
+  return false;
+}
+
+// 決定這則訊息要處理、回指令、還是完全沉默（hasDraft=true 代表該使用者有待補件草稿）
+function decideFlow(text, hasDraft) {
+  var t = String(text || '').trim();
+  if (!t) return { mode: 'silent', reason: '空訊息' };
+  if (isHelpCommand(t)) return { mode: 'command', handler: 'help' };
+  if (isModelCommand(t)) return { mode: 'command', handler: 'model' };
+
+  var stripped = stripWakeWord(t);
+  var woke = stripped !== null;
+
+  if (!woke && !hasDraft && !isReplyAllMode()) {
+    return { mode: 'silent', reason: '未帶喚醒字（' + (CONFIG.WAKE_WORDS || []).join('/') + '）' };
+  }
+  var body = woke ? stripped : t;
+  if (!body) return { mode: 'empty', text: '' };
+  if (isReadOnlyAsking(body) && !isReplyAllMode()) {
+    return { mode: 'silent', reason: '查詢類，請直接用瀏覽器開試算表' };
+  }
+  return { mode: 'ai', text: body, woke: woke };
+}
+
+// AI 判定後的最終把關：只有寫入類意圖（含寫入失敗的提示）才回訊
+function shouldReplyFor(action) {
+  var a = String(action || '').toUpperCase();
+  if (isReplyAllMode()) return true;
+  return a === 'CREATE' || a === 'UPDATE';
+}
+
+// ==================== 2.5 LINE 端模型管理指令 (/model, 模型) ====================
+function isModelCommand(text) {
+  var lower = text.toLowerCase().trim();
+  return lower.indexOf('/model') === 0 || lower.indexOf('模型') === 0 || lower.indexOf('查模型') === 0;
+}
+
+function handleModelCommand(text) {
+  var parts = text.split(/\s+/);
+  var manualModel = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL');
+  var candidates = getCandidateModels();
+
+  if (parts.length === 1 || /^(list|清單)$/i.test(parts[1])) {
+    var reply = '🤖 【Gemini 模型設定狀態】\n━━━━━━━━━━━━━━\n';
+    if (manualModel) {
+      reply += '📌 當前模式：手動鎖定\n🎯 使用模型：' + manualModel + '（失效時自動退回清單其他模型）\n\n';
+    } else {
+      reply += '📌 當前模式：自動優先（依序尝试）\n🎯 目前優先：' + candidates[0] + '\n\n';
+    }
+    reply += '📋 偵測到此金鑰可用模型：\n';
+    candidates.slice(0, 8).forEach(function(m, idx) {
+      reply += (idx + 1) + '. ' + m + (m === (manualModel || CONFIG.GEMINI_MODEL) ? ' ← 使用中' : '') + '\n';
+    });
+    reply += '━━━━━━━━━━━━━━\n💡 切換：/model <模型名>（例：/model gemini-3.6-flash）\n💡 恢復預設：/model auto\n💡 完整使用說明：/help';
+    return reply;
+  }
+
+  var target = parts[1].trim();
+  if (/^(auto|reset|自動|預設)$/i.test(target)) {
+    PropertiesService.getScriptProperties().deleteProperty('GEMINI_MODEL');
+    return '🔄 已恢復【自動模式】：將依「預設模型 > 最新可用模型清單」順序嘗試調用。';
+  }
+
+  PropertiesService.getScriptProperties().setProperty('GEMINI_MODEL', target);
+  return '✅ 已切換模型為：「' + target + '」\n下一則訊息立即生效。若此模型失效，系統會自動退回其他可用模型並繼續回覆。';
+}
+
+// ==================== 2.6 LINE 端使用說明指令 (/help, 使用方式, 說明) ====================
+function isHelpCommand(text) {
+  var lower = text.toLowerCase().trim();
+  return lower === '/help' || lower === 'help' || lower === '/?' || lower === '?' || lower === '？' ||
+         lower === '說明' || lower === '使用說明' || lower === '使用方式' || lower === '功能' ||
+         lower === '菜單' || lower === '操作說明';
+}
+
+function handleHelpCommand() {
+  var wake = (CONFIG.WAKE_WORDS && CONFIG.WAKE_WORDS[0]) || '小幫手';
+  var req = (CONFIG.REQUIRED_FIELDS || []).map(function(k) { return CONFIG.FIELD_LABELS[k]; }).join('、');
+  var lines = [
+    '⛩️ 【光明燈管理系統｜使用方式】',
+    '━━━━━━━━━━━━━━',
+    '🔔 先喊「' + wake + '」我才會處理（也可用：' + (CONFIG.WAKE_WORDS || []).join('／') + '）',
+    '',
+    '📝 1. 新增登記（必填：' + req + '）',
+    '　 例：' + wake + ' 聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華',
+    '　 例：' + wake + ' 我要登記，媽祖廟新增財神燈500盞，業務王小明',
+    '　 ⚠️ 必填欄位缺任何一項都不會上表，我會回覆「還需要什麼」格式',
+    '　 👤 業務身分綁定一次就好（未填業務時自動帶入）：',
+    '　　　 例：' + wake + ' 我是聖文　／　' + wake + ' 我公司 亞盛燈業 我叫 李小華',
+    '　　　 綁兩段時業務欄顯示「亞盛燈業-李小華」；換人或換公司再傳一次蓋掉',
+    '　 👤 單筆想填別家：直接寫在句首，例：' + wake + ' 甫穎-仁武保安宮 ...',
+    '　 ⏳ 收到提示後 ' + Math.round(CONFIG.DRAFT_TTL / 60) + ' 分鐘內直接補（例：' + wake + ' 規格5*7 OLED琥珀色），我會自動合併',
+    '　 ⚠️ 同廟同規格已存在會先提示；確定是第二批請加「強制新增」',
+    '',
+    '✏️ 2. 修改（需含「廟宇」＋「規格」才能定位）',
+    '　 例：' + wake + ' 修改 新化武廟 4*5 OLED琥珀色 總燈數變成5238盞 軟體冠緯 電腦研華',
+    '　 例：' + wake + ' 金六結福德廟 5*7 OLED 送燈改成 國115/03/01前',
+    '　 ✔️ 只講要改的欄位就好，沒提到的欄位不會被清空',
+    '　 ✔️ 該廟只有一種規格時，可直接說「修改 新化武廟 總燈數變成5238盞」',
+    '',
+    '🔍 3. 查詢：建議直接用瀏覽器開試算表（LINE 端查詢不回訊）',
+    '',
+    '🤖 4. AI 模型管理',
+    '　 /model　　　　　查看目前模型與可用清單',
+    '　 /model <模型名>　切換指定模型',
+    '　 /model auto　　　恢復自動模式',
+    '',
+    '📋 可辨識欄位：業務｜廟宇｜規格｜總燈數｜送燈日期｜軟體｜電腦',
+    '💡 送燈日期保留您的寫法（國10/17前、12/10or12/17、已送燈），系統只在右側輔助欄另存 YYYY-MM-DD',
+    '💡 合計／小計公式請放最右側欄（I 欄以後），機器人只寫 A~H，絕不動到你的公式',
+    '',
+    '🔕 回覆規則：只在「新增／修改」與「資料不全需補件」時回訊',
+    '　 未帶喚醒字、查詢、閒聊一律不回覆',
+    '　 想恢復全部回覆：GAS 專案設定 → 腳本屬性 → 新增 REPLY_MODE = ALL',
+    '━━━━━━━━━━━━━━',
+    '✨ 帶「' + wake + '」開頭直接輸入登記內容；輸入 /help 隨時回來看說明。'
+  ];
+  return lines.join('\n');
+}
+
+// 向 Gemini 查詢這把金鑰實際可用的 flash 系列模型（結果快取 6 小時）
+function getCandidateModels() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get('GEMINI_MODELS');
+  if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+
+  var fallback = [CONFIG.GEMINI_MODEL].concat(['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3-flash-preview']);
+  try {
+    var url = 'https://generativelanguage.googleapis.com/v1beta/models?key=' + CONFIG.GEMINI_API_KEY + '&pageSize=200';
+    var resp = UrlFetchApp.fetch(url, { "method": "get", "muteHttpExceptions": true });
+    if (resp.getResponseCode() === 200) {
+      var models = JSON.parse(resp.getContentText()).models || [];
+      var usable = [];
+      for (var i = 0; i < models.length; i++) {
+        var name = (models[i].name || '').replace('models/', '');
+        var methods = models[i].supportedGenerationMethods || [];
+        if (methods.indexOf('generateContent') !== -1 && /flash/i.test(name) &&
+            !/image|tts|audio|live|vision|embedding|robotics|computer|omni|lyria|native/i.test(name)) {
+          usable.push(name);
+        }
+      }
+      if (usable.length > 0) {
+        var list = dedupe(usable.sort(modelVersionDesc));
+        cache.put('GEMINI_MODELS', JSON.stringify(list), 21600);
+        return list;
+      }
+    }
+  } catch (e) {
+    console.error('getCandidateModels 異常: ' + e.toString());
+  }
+  return dedupe(fallback);
+}
+
+function dedupe(arr) {
+  var seen = {};
+  return arr.filter(function(x) { if (!x || seen[x]) return false; seen[x] = true; return true; });
+}
+
+function modelVersionDesc(a, b) {
+  function score(n) {
+    var m = n.match(/(\d+(?:\.\d+)?)/);
+    var v = m ? parseFloat(m[1]) : 0;
+    return v + (/preview|exp|latest/i.test(n) ? -0.001 : 0);
+  }
+  return score(b) - score(a);
+}
+
+// ==================== 3. Gemini API 串接與語意分析 ====================
+function analyzeMessageWithGemini(text) {
+  
+  var prompt = "你是一個宮廟「光明燈規格管理」的自動化助手。請分析使用者的輸入，並輸出為 JSON 格式（不要包含任何 ```json 字樣或 Markdown 外殼）。\n\n" +
+               "【使用者輸入】: \"" + text + "\"\n\n" +
+               "【輸出 JSON 欄位規範】:\n" +
+               "1. action: 必須是 'CREATE'（新增）、'UPDATE'（修改）或 'READ'（查詢）其中之一。\n" +
+               "2. details: 擷取核心資訊物件，包含以下欄位（若無提及則填 null，不可自行編造）:\n" +
+               "   - agent: 業務 / 經辦人姓名（例：聖文、甫穎、冠緯、家森、冠宇）\n" +
+               "   - temple: 廟宇 / 廟方名稱（例：石岡子乾元宮、桃園廣盛壇、新化武廟）\n" +
+               "   - spec: 規格，請「原樣保留」尺寸、燈種與顏色（例：5*7 OLED琥珀色、4*5 OLED、7*9 OLED琥珀色）\n" +
+               "   - total_count: 總燈數（必須是純數字，移除千分逗號；「2,112盞」請填 2112）\n" +
+               "   - delivery_text: 送燈日期，請「原樣保留」使用者的寫法，包含「國」「前」「or」或「已送燈」等字樣（例：國10/17前、12/10or12/17、國115-02/09前、已送燈）。切勿自行換算成 YYYY-MM-DD。\n" +
+               "   - software: 軟體（例：廟幫手、冠緯、家森、冠宇、其他、廟管家）\n" +
+               "   - computer: 電腦／硬體（例：研華、廟、研華*3）\n\n" +
+               "【重要規則】:\n" +
+               "A. 使用者常把業務與廟名用「-」「－」「—」連寫（例：「聖文-石岡子乾元宮」），此時「-」之前是 agent，之後是 temple，必須拆開。\n" +
+               "B. 「國115/02/09」屬民國年、「國10/17」屬國曆月日，兩者都只是日期寫法差異，原字串照抄進 delivery_text。\n" +
+               "C. 同一間廟可能同時有 4*5 與 5*7 兩種規格，因此 spec 是重要的定位欄位，有提到就一定要填。\n" +
+               "D. 語意為「查詢/有哪些/帮我查」時 action='READ'；「改成/調整/補登記」時 action='UPDATE'；其餘登記類描述為 'CREATE'。\n\n" +
+               "【範例 1：新增（業務與廟名連寫）】:\n" +
+               "輸入:「聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華」\n" +
+               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"聖文\",\"temple\":\"石岡子乾元宮\",\"spec\":\"5*7 OLED琥珀色\",\"total_count\":2112,\"delivery_text\":\"國10/17前\",\"software\":\"其他\",\"computer\":\"研華\"}}\n\n" +
+               "【範例 2：新增（口語敘述）】:\n" +
+               "輸入:「業務王小明登記，媽祖廟要新增財神燈500盞，預計10月15送燈」\n" +
+               "輸出: {\"action\":\"CREATE\",\"details\":{\"agent\":\"王小明\",\"temple\":\"媽祖廟\",\"spec\":\"財神燈\",\"total_count\":500,\"delivery_text\":\"10月15\",\"software\":null,\"computer\":null}}\n\n" +
+               "【範例 3：修改】:\n" +
+               "輸入:「幫我修改新化武廟 4*5 OLED琥珀色 的總燈數變成5238盞，軟體冠緯、電腦研華」\n" +
+               "輸出: {\"action\":\"UPDATE\",\"details\":{\"agent\":null,\"temple\":\"新化武廟\",\"spec\":\"4*5 OLED琥珀色\",\"total_count\":5238,\"delivery_text\":null,\"software\":\"冠緯\",\"computer\":\"研華\"}}\n\n" +
+               "【範例 4：查詢】:\n" +
+               "輸入:「查一下金六結福德廟有哪些燈」\n" +
+               "輸出: {\"action\":\"READ\",\"details\":{\"agent\":null,\"temple\":\"金六結福德廟\",\"spec\":null,\"total_count\":null,\"delivery_text\":null,\"software\":null,\"computer\":null}}";
+
+  var payload = {
+    "contents": [{ "parts": [{ "text": prompt }] }],
+    "generationConfig": { "responseMimeType": "application/json" }
+  };
+
+  var options = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+
+  // 嘗試順序：手動鎖定模型 > 預設模型 > 自動探測的最新可用模型
+  var manualModel = PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL');
+  var order = dedupe([manualModel, CONFIG.GEMINI_MODEL].concat(getCandidateModels())).slice(0, 6);
+  var lastErr = '';
+  var lastCode = 0;
+
+  for (var mi = 0; mi < order.length; mi++) {
+    var tryUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + order[mi] + ":generateContent?key=" + CONFIG.GEMINI_API_KEY;
+    var response = UrlFetchApp.fetch(tryUrl, options);
+    var respCode = response.getResponseCode();
+    var bodyText = response.getContentText();
+
+    if (respCode !== 200) {
+      lastErr = '模型 ' + order[mi] + ' (HTTP ' + respCode + '): ' + bodyText.substring(0, 200);
+      lastCode = respCode;
+      // 429/503 屬暫時性（配額或壅塞），每个模型各自獨立，繼續換下一個並稍作等待
+      if ((respCode === 429 || respCode === 500 || respCode === 503 || respCode === 504) && mi < order.length - 1) {
+        Utilities.sleep(1200);
+      }
+      continue;
+    }
+    try {
+      var jsonResponse = JSON.parse(bodyText);
+      if (!jsonResponse.candidates || !jsonResponse.candidates[0]) {
+        lastErr = '模型 ' + order[mi] + ' 無候選回覆: ' + bodyText.substring(0, 200);
+        continue;
+      }
+      var parts = jsonResponse.candidates[0].content.parts || [];
+      var aiText = parts.map(function(p){ return p.text || ''; }).join('').trim();
+      return JSON.parse(aiText);
+    } catch (e) {
+      lastErr = '模型 ' + order[mi] + ' 解析失敗: ' + e.toString();
+      continue;
+    }
+  }
+  if (lastCode === 503 || lastCode === 500 || lastCode === 504) {
+    throw new Error('AI 模型暫時壅塞（已嘗試 ' + order.length + ' 個模型），請稍候 1 分鐘重傳；或輸入「/model gemini-3.1-flash-lite」改用較穩定模型。');
+  }
+  if (lastCode === 429) {
+    throw new Error('AI 免費配額暫時用盡（已嘗試 ' + order.length + ' 個模型），請稍後重試或輸入「/model gemini-3.1-flash-lite」。');
+  }
+  throw new Error('Gemini API 異常: ' + lastErr);
+}
+
+// ==================== 4. 核心業務邏輯：新增、修改、查詢 ====================
+function getLightSheet() {
+  var ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  return ss.getSheetByName(CONFIG.SHEET_NAMES.LIGHT_MGMT);
+}
+
+function sheetTimeZone() {
+  try { return Session.getScriptTimeZone(); } catch (e) { return 'Asia/Taipei'; }
+}
+
+// 資料區（含表頭）；一律裁到 DATE_KEY 寬，右側由使用者自放的合計/公式欄不受影響
+function readData(sheet) {
+  var width = CONFIG.COLUMNS.DATE_KEY;
+  var values = sheet.getDataRange().getValues();
+  var trimmed = [];
+  for (var i = 0; i < values.length; i++) {
+    var row = values[i].slice(0, width);
+    for (var j = row.length; j < width; j++) row.push('');
+    trimmed.push(row);
+  }
+  return trimmed;
+}
+
+// 需要的輔助欄（正規日期）若超出目前欄數，先自動補欄避免 getRange 越界
+function ensureColumnWidth(sheet) {
+  var need = CONFIG.COLUMNS.DATE_KEY;
+  if (sheet.getMaxColumns() < need) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), need - sheet.getMaxColumns());
+  }
+}
+
+// 於 GAS 編輯器手動執行一次：補齊欄位並寫入表頭
+function setupLightHeader() {
+  var sheet = getLightSheet();
+  if (!sheet) throw new Error('找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」');
+  ensureColumnWidth(sheet);
+  sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setValues([CONFIG.HEADERS]);
+  Logger.log('✅ 表頭已寫入：' + CONFIG.HEADERS.join(' | '));
+  return CONFIG.HEADERS;
+}
+
+// 依欄位索引取儲存格（統一回傳字串處理安全）
+function cell(row, colEnum) {
+  var v = row[colEnum - 1];
+  if (v === null || v === undefined) return '';
+  if (v instanceof Date) {
+    try { return Utilities.formatDate(v, sheetTimeZone(), 'yyyy-MM-dd'); } catch (e) { return String(v); }
+  }
+  return String(v).trim();
+}
+
+// 「合計燈數」等小計／標題列一律跳過：只掃 業務／廟宇／規格 三欄文字，
+// 右側自放的合計公式欄與使用者自行處理的小計都不會被誤判
+function isSummaryRow(row) {
+  var C = CONFIG.COLUMNS;
+  var text = [cell(row, C.AGENT), cell(row, C.TEMPLE), cell(row, C.SPEC)].join(' ');
+  return /合計|總計|小計/.test(text);
+}
+
+function toNumber(v) {
+  if (typeof v === 'number') return v;
+  var n = parseInt(String(v === null || v === undefined ? '' : v).replace(/[^\d]/g, ''), 10);
+  return isNaN(n) ? 0 : n;
+}
+
+function withComma(v) {
+  var n = toNumber(v);
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// 規格正規化：5*7 / 5×7 / 5 7 / 大寫小寫 皆視為相同
+function normSpec(v) {
+  return String(v === null || v === undefined ? '' : v).toLowerCase().replace(/[\s　*×x✕＊＊]/g, '');
+}
+
+function normName(v) {
+  return String(v === null || v === undefined ? '' : v).replace(/[\s　（）()、,，]/g, '');
+}
+
+function matchTemple(cellVal, keyword) {
+  var a = normName(cellVal), b = normName(keyword);
+  if (!a || !b) return false;
+  return a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+}
+
+function matchSpec(cellVal, keyword) {
+  var a = normSpec(cellVal), b = normSpec(keyword);
+  if (!a || !b) return false;
+  return a === b || a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+}
+
+function containsLoose(cellVal, keyword) {
+  var a = normName(cellVal), b = normName(keyword);
+  return !!a && !!b && (a.indexOf(b) !== -1 || b.indexOf(a) !== -1);
+}
+
+// 送燈日期正規化（僅作為右側輔助欄）：支援「國10/17前」「國115-02/09前」「12/10or12/17」「10月15日」「已送燈」
+function parseDateKey(raw) {
+  if (raw === null || raw === undefined || raw === '') return '';
+  if (raw instanceof Date) {
+    try { return Utilities.formatDate(raw, sheetTimeZone(), 'yyyy-MM-dd'); } catch (e) { return ''; }
+  }
+  var s = String(raw)
+    .replace(/[\s　]/g, '')
+    .replace(/[／]/g, '/')
+    .replace(/[－—–]/g, '-')
+    .replace(/日/g, '');
+  s = s.replace(/月/g, '/');
+  if (/已送燈|已送|已完|送完|已完成/.test(s)) return '';
+
+  var y = 0, m = 0, d = 0;
+  var full = s.match(/(?:民國|民|國|西元|公元)?(\d{2,4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (full) {
+    y = parseInt(full[1], 10); m = parseInt(full[2], 10); d = parseInt(full[3], 10);
+    if (y < 1911) y += 1911;  // 民國 115 -> 2026
+  } else {
+    var md = s.match(/(\d{1,2})\/(\d{1,2})/);
+    if (md) {
+      y = new Date().getFullYear(); m = parseInt(md[1], 10); d = parseInt(md[2], 10);
+    }
+  }
+  if (!y || !m || !d || m < 1 || m > 12 || d < 1 || d > 31) return '';
+  var dt = new Date(y, m - 1, d);
+  if (isNaN(dt.getTime())) return '';
+  try { return Utilities.formatDate(dt, sheetTimeZone(), 'yyyy-MM-dd'); } catch (e) { return y + '-' + m + '-' + d; }
+}
+
+// 依 details 組出一列寫入值（依照 CONFIG.COLUMNS 索引摆放，可補洞）
+function buildRowValues(d) {
+  var C = CONFIG.COLUMNS;
+  var vals = [];
+  vals[C.AGENT - 1] = d.agent || '';
+  vals[C.TEMPLE - 1] = d.temple || '';
+  vals[C.SPEC - 1] = d.spec || '';
+  vals[C.TOTAL - 1] = toNumber(d.total_count);
+  vals[C.DELIVERY - 1] = d.delivery_text || '';
+  vals[C.SOFTWARE - 1] = d.software || '';
+  vals[C.COMPUTER - 1] = d.computer || '';
+  vals[C.DATE_KEY - 1] = parseDateKey(d.delivery_text);
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i] === undefined) vals[i] = '';
+  }
+  return vals;
+}
+
+function formatRecordLine(row, prefix) {
+  var C = CONFIG.COLUMNS;
+  var head = (cell(row, C.AGENT) || '未註明') + '｜' + (cell(row, C.TEMPLE) || '未註明');
+  return (prefix || '') + '🏮 ' + head + '\n' +
+         '    規格：' + (cell(row, C.SPEC) || '未註明') + '｜燈數：' + withComma(cell(row, C.TOTAL)) + ' 盞\n' +
+         '    送燈：' + (cell(row, C.DELIVERY) || '未註明') +
+         '｜軟體：' + (cell(row, C.SOFTWARE) || '未註明') +
+         '｜電腦：' + (cell(row, C.COMPUTER) || '未註明');
+}
+
+function handleDataRouting(aiResult, originalText) {
+  var sheet = getLightSheet();
+  if (!sheet) return "系統錯誤：找不到名為「" + CONFIG.SHEET_NAMES.LIGHT_MGMT + "」的工作表分頁，請先在試算表中建立此分頁。";
+  if (!aiResult || !aiResult.details) return "【⚠️ 無法解析】AI 未回傳有效欄位，請換一種說法重試（輸入 /help 看範例）。";
+
+  ensureColumnWidth(sheet);
+  var action = String(aiResult.action || '').toUpperCase();
+  var d = aiResult.details;
+
+  if (action === 'CREATE') return doCreate(sheet, d, originalText);
+  if (action === 'UPDATE') return doUpdate(sheet, d, originalText);
+  if (action === 'READ') return doRead(sheet, d, originalText);
+  return "【⚠️ 無法辨識意圖】（" + (aiResult.action || '無') + "）\n💡 輸入 /help 查看使用方式";
+}
+
+// ------------------ 1. 新增 ------------------
+function doCreate(sheet, d, originalText) {
+  var C = CONFIG.COLUMNS;
+  if (!d.temple && !d.spec) {
+    return "【⚠️ 新增失敗】至少要寫「廟宇」與「規格」，例：\n聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華";
+  }
+
+  var data = readData(sheet);
+  var dupRow = 0;
+  for (var i = 1; i < data.length; i++) {
+    if (isSummaryRow(data[i])) continue;
+    if (matchTemple(cell(data[i], C.TEMPLE), d.temple) && matchSpec(cell(data[i], C.SPEC), d.spec)) {
+      dupRow = i + 1; break;
+    }
+  }
+
+  // 同一廟＋同一規格預設視為同一筆，避免重複登記；加「強制新增」可覆蓋
+  if (dupRow > 0 && !/強制新增/.test(originalText || '')) {
+    var exist = data[dupRow - 1];
+    return "【⚠️ 疑似重複登記】第 " + dupRow + " 列已有同廟同規格紀錄：\n" +
+           formatRecordLine(exist, '    ') + "\n" +
+           "✏️ 若是要改數量，請改說：修改 " + (d.temple || '') + " " + (d.spec || '') + " 總燈數變成 2500 盞\n" +
+           "💡 若這真的是第二批，請在訊息尾端加上「強制新增」再送一次。";
+  }
+
+  var newRow = buildRowValues(d);
+  sheet.appendRow(newRow);
+  return "【🟢 新增成功】已寫入第 " + sheet.getLastRow() + " 列\n" + formatRecordLine(newRow, '');
+}
+
+// ------------------ 2. 修改 ------------------
+function doUpdate(sheet, d, originalText) {
+  var C = CONFIG.COLUMNS;
+  if (!d.temple && !d.agent) {
+    return "【⚠️ 修改失敗】請至少提供「廟宇」名稱，例：修改 新化武廟 4*5 OLED琥珀色 總燈數變成 5238 盞";
+  }
+
+  var data = readData(sheet);
+  // 「某某 業務改成 聖文」這類是改名，業務欄不可拿來當定位條件
+  var agentRename = /業務\s*(?:改成|換成|改為|更新為)|(?:改成|換成)業務/.test(originalText || '');
+  var collect = function(useSpec) {
+    var out = [];
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      if (isSummaryRow(row)) continue;
+      if (d.temple && !matchTemple(cell(row, C.TEMPLE), d.temple)) continue;
+      if (d.agent && !agentRename && !containsLoose(cell(row, C.AGENT), d.agent)) continue;
+      if (useSpec && d.spec && !matchSpec(cell(row, C.SPEC), d.spec)) continue;
+      out.push(i + 1);
+    }
+    return out;
+  };
+
+  var hits = collect(true);
+  // 「規格改成 ...」這類輸入：找不到同規格列時，退而用廟名定位（僅限該廟只有一列），
+  // 才允許換規格欄，避免同廟多規格時改錯列
+  var specChange = false;
+  if (hits.length === 0 && d.spec && /規格\s*[改換調]|改成|換成|改為/.test(originalText || '')) {
+    var alt = collect(false);
+    if (alt.length === 1) { hits = alt; specChange = true; }
+  }
+
+  if (hits.length === 0) {
+    var tips = [];
+    for (var k = 1; k < data.length; k++) {
+      if (isSummaryRow(data[k])) continue;
+      if (d.temple && matchTemple(cell(data[k], C.TEMPLE), d.temple)) {
+        tips.push('    · 第' + (k + 1) + '列 ' + (cell(data[k], C.SPEC) || '未填規格'));
+      }
+      if (tips.length >= CONFIG.MAX_LIST_ROWS) break;
+    }
+    return "【❌ 修改失敗】找不到「" + (d.temple || d.agent) + "」" + (d.spec ? ' ＋規格「' + d.spec + '」' : '') + ' 的資料。' +
+           (tips.length ? "\n📋 該廟既有規格：\n" + tips.join('\n') : '') +
+           "\n💡 輸入 /help 查看使用方式";
+  }
+
+  // 同廟多規格：未指明規格時先請使用者補充，避免改錯列
+  if (hits.length > 1) {
+    var opts = hits.slice(0, CONFIG.MAX_LIST_ROWS).map(function(r) {
+      return '    · 第' + r + '列 ' + (cell(data[r - 1], C.SPEC) || '未填規格') + '（' + withComma(cell(data[r - 1], C.TOTAL)) + ' 盞）';
+    });
+    return "【⚠️ 需要指明規格】「" + (d.temple || d.agent) + '」符合 ' + hits.length + " 筆：\n" + opts.join('\n') +
+           (d.spec ? "\n（同一規格也有多筆，請再指明業務，或改用「強制新增」補一筆）" : '') +
+           '\n例：修改 ' + (d.temple || '') + ' ' + (cell(data[hits[0] - 1], C.SPEC) || '5*7 OLED琥珀色') + ' 總燈數變成 100 盞';
+  }
+
+  var r = hits[0];
+  var target = data[r - 1];
+  var changes = [];
+  var apply = function(colEnum, label, newVal, opts) {
+    if (newVal === null || newVal === undefined || newVal === '') return;
+    var fmt = (opts && opts.fmt) || function(v) { return v; };
+    var unit = (opts && opts.unit) || '';
+    var oldVal = cell(target, colEnum);
+    if (String(oldVal) === String(newVal)) return;
+    sheet.getRange(r, colEnum).setValue(newVal);
+    changes.push('    ' + label + '：' + (oldVal === '' ? '（原空白）' : fmt(oldVal) + unit) + ' → ' + fmt(newVal) + unit);
+  };
+
+  apply(C.AGENT, '業務', d.agent);
+  apply(C.TOTAL, '總燈數', d.total_count ? toNumber(d.total_count) : null, { fmt: withComma, unit: ' 盞' });
+  if (d.delivery_text) {
+    apply(C.DELIVERY, '送燈日期', d.delivery_text);
+    apply(C.DATE_KEY, '正規日期', parseDateKey(d.delivery_text));
+  }
+  apply(C.SOFTWARE, '軟體', d.software);
+  apply(C.COMPUTER, '電腦', d.computer);
+  apply(C.SPEC, '規格', specChange ? d.spec : null);
+
+  var title = "【🟡 修改成功】第 " + r + " 列｜" + (cell(target, C.AGENT) || '未註明') + '－' + (cell(target, C.TEMPLE) || '未註明') +
+              '（' + (cell(target, C.SPEC) || '未填規格') + '）';
+  if (changes.length === 0) return title + "\n    ℹ️ 提供的欄位與現有數值相同，未做更新。";
+  return title + '\n' + changes.join('\n');
+}
+
+// 批次把業務／公司名改名（GAS 編輯器執行；dryRun=true 只預覽不寫入）
+// 例：renameAgent('明典', '聖文', true) 先看會改到哪些列，確認後再改 renameAgent('明典', '聖文')
+function renameAgent(fromName, toName, dryRun) {
+  var C = CONFIG.COLUMNS;
+  var sheet = getLightSheet();
+  if (!sheet) return '找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」';
+  if (!fromName || !toName) return '請輸入兩個名稱：renameAgent("舊名", "新名")';
+
+  var data = readData(sheet), rows = [], preview = [];
+  for (var i = 1; i < data.length; i++) {
+    if (isSummaryRow(data[i])) continue;
+    var cur = cell(data[i], C.AGENT);
+    if (!cur || cur.indexOf(fromName) === -1) continue;
+    var next = cur.split(fromName).join(toName);
+    rows.push(i + 1);
+    preview.push('    第 ' + (i + 1) + ' 列：' + cur + ' → ' + next + '（' + cell(data[i], C.TEMPLE) + '）');
+    if (!dryRun) sheet.getRange(i + 1, C.AGENT).setValue(next);
+  }
+
+  // 使用者綁定的身分也一起換掉，免得之後又寫回舊名
+  var bindHit = 0;
+  if (!dryRun) {
+    try {
+      var map = readIdentities(), changed = false;
+      Object.keys(map).forEach(function(uid) {
+        var idt = map[uid] || {};
+        ['company', 'person', 'label'].forEach(function(f) {
+          if (idt[f] && String(idt[f]).indexOf(fromName) !== -1) { idt[f] = String(idt[f]).split(fromName).join(toName); changed = true; bindHit++; }
+        });
+      });
+      if (changed) PropertiesService.getScriptProperties().setProperty(IDENTITY_KEY, JSON.stringify(map));
+    } catch (e) { console.error('renameAgent 更新綁定失敗: ' + e.toString()); }
+  }
+
+  var msg = (dryRun ? '【預覽】' : '【已完成】') + '「' + fromName + '」→「' + toName + '」共 ' + rows.length + ' 列' +
+            (bindHit ? '；另更新 ' + bindHit + ' 個已綁定身分' : '') + '\n' + (preview.join('\n') || '    （沒有符合的列）');
+  Logger.log(msg);
+  return msg;
+}
+
+// ------------------ 3. 查詢 ------------------
+function doRead(sheet, d, originalText) {
+  var C = CONFIG.COLUMNS;
+  var data = readData(sheet);
+  var hasFilter = !!(d.agent || d.temple || d.spec || d.software || d.computer);
+  var hits = [];
+  var totalSum = 0;
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (isSummaryRow(row)) continue;
+    if (!hasFilter) { hits.push(row); continue; }
+    var ok = true;
+    if (d.temple && !matchTemple(cell(row, C.TEMPLE), d.temple)) ok = false;
+    if (ok && d.spec && !matchSpec(cell(row, C.SPEC), d.spec)) ok = false;
+    if (ok && d.agent && !containsLoose(cell(row, C.AGENT), d.agent)) ok = false;
+    if (ok && d.software && !containsLoose(cell(row, C.SOFTWARE), d.software)) ok = false;
+    if (ok && d.computer && !containsLoose(cell(row, C.COMPUTER), d.computer)) ok = false;
+    if (ok) hits.push(row);
+  }
+
+  if (hits.length === 0) {
+    return "【📭 查詢無結果】找不到符合條件的燈位紀錄。\n💡 可試：查一下 金六結福德廟 ／ 查詢 5*7 OLED ／ 查 冠緯 的軟體燈位";
+  }
+
+  var matched = hasFilter ? hits.slice(0, CONFIG.MAX_LIST_ROWS) : hits.slice(-CONFIG.MAX_LIST_ROWS);
+  hits.forEach(function(row) { totalSum += toNumber(cell(row, C.TOTAL)); });
+
+  var lines = matched.map(function(row) { return formatRecordLine(row, ''); });
+  var head = hasFilter
+    ? '【🔍 查詢結果】共 ' + hits.length + ' 筆｜合計 ' + withComma(totalSum) + ' 盞'
+    : '【🔍 最近 ' + matched.length + ' 筆登記】共 ' + hits.length + " 筆資料（請指定廟宇或規格可縮小範圍）";
+  var tail = hits.length > matched.length ? "\n……（" + (hasFilter ? '僅顯示前 ' : '僅顯示最新 ') + matched.length + ' 筆，共 ' + hits.length + ' 筆）' : '';
+  return head + '\n\n' + lines.join('\n------------------\n') + tail;
+}
+
+// ==================== 5. LINE 回傳訊息工具 ====================
+function sendLineReply(replyToken, messageText) {
+  // ⭐ 必須是這個完整的官方 API 網址，LINE 才能收到你的回信
+  var url = "https://api.line.me/v2/bot/message/reply";
+  
+  var payload = {
+    "replyToken": replyToken,
+    "messages": [{ "type": "text", "text": messageText }]
+  };
+  
+  var options = {
+    "method": "post",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + CONFIG.LINE_ACCESS_TOKEN
+    },
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true // 💡 加上這一行，就算 LINE 拒絕，GAS 也不會整支崩潰，會在日誌留下紀錄
+  };
+  
+  // 執行發送
+  var response = UrlFetchApp.fetch(url, options);
+  
+  // 可以在日誌中查看 LINE 回傳的狀態，方便抓漏
+  console.log("LINE 回應狀態碼: " + response.getResponseCode());
+  console.log("LINE 回應內容: " + response.getContentText());
+}
+
+// ==================== 6. 網頁瀏覽器直接開啟端 (GET) ====================
+function doGet(e) {
+  // 當用瀏覽器直接點開網址時，會看到這個漂亮精簡的網頁回應
+  var htmlContent = 
+    "<div style='font-family: Arial, sans-serif; text-align: center; margin-top: 100px; padding: 20px; border: 1px solid #ddd; display: inline-block; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>" +
+    "  <h1 style='color: #d9534f; margin-bottom: 5px;'>⛩️ 宮廟光明燈管理系統</h1>" +
+    "  <p style='color: #666; font-size: 14px;'>Google Apps Script 後端雲端服務</p>" +
+    "  <hr style='border: 0; border-top: 1px solid #eee; margin: 20px 0;'>" +
+    "  <div style='background-color: #dff0d8; color: #3c763d; padding: 10px 20px; border-radius: 4px; font-weight: bold;'>🟢 系統連線狀態：正常運作中</div>" +
+    "  <p style='color: #888; font-size: 12px; margin-top: 20px;'>請透過已綁定的 LINE 官方帳號進行「新增、修改、查詢」操作；輸入 /help 可查看使用方式。</p>" +
+    "</div>";
+    
+  return HtmlService.createHtmlOutput(htmlContent).setTitle("光明燈管理系統端點");
+}
+
+function testGeminiProbe() {
+  var candidates = getCandidateModels();
+  Logger.log('📋 金鑰可用模型: ' + candidates.join(' , '));
+  var r = analyzeMessageWithGemini('聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華');
+  Logger.log('✅ Gemini 解析成功: ' + JSON.stringify(r));
+  Logger.log('📅 輔助日期欄將寫入: ' + (parseDateKey(r.details.delivery_text) || '(空白)'));
+}
+
+function testLineToken() {
+  var resp = UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
+    headers: { 'Authorization': 'Bearer ' + CONFIG.LINE_ACCESS_TOKEN },
+    muteHttpExceptions: true
+  });
+  Logger.log('🔑 LINE Token 檢查 HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText());
+}
+
+function testAllPermissions() {
+  Logger.log('🚀 開始檢測並打通【Google 日曆 ＆ Google 聯絡人】雙向授權...');
+  
+  // 1. 測試 Google 日曆連線
+  try {
+    const calId = testCreateCalendarEvent();
+    Logger.log('✅ Google 日曆授權與活動建立測試成功！');
+  } catch (e) {
+    Logger.log('❌ Google 日曆測試異常: ' + e.message);
+  }
+
+  // 2. 測試 Google 聯絡人連線
+  Logger.log('🎉 【恭喜】Google 日曆 ＆ Google 聯絡人雙向雲端授權已 100% 打通完成！');
+}
+
+function testCreateCalendarEvent() {
+  const cal = CalendarApp.getDefaultCalendar();
+  const sampleTime = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const event = cal.createEvent('【測試】全能管家日曆連線成功', sampleTime, new Date(sampleTime.getTime() + 3600000), {
+    description: '恭喜！您的 LINE 智慧管家已成功取得 Google 日曆授權！'
+  });
+  Logger.log('🎉 Google 日曆授權並建立成功，活動 ID: ' + event.getId());
+  return event.getId();
+}
+
+function testCreateContact() {
+  const sample = createGoogleContact({
+    name: '測試聯絡人',
+    phone: '0912-345678',
+    email: 'test@example.com',
+    company_title: '測試學校 教師'
+  });
+  Logger.log('🎉 Google 聯絡人授權並建立成功: ' + JSON.stringify(sample));
+}
+
+// ==================== 9. Google 日曆與 Google 聯絡人自動同步核心 ====================
+function createGoogleCalendarEvent(cal) {
+  if (!cal || !cal.title) return { success: false, error: '無事項標題' };
+
+  try {
+    const calendar = CalendarApp.getDefaultCalendar();
+    const targetTimeStr = cal.target_time;
+    const title = cal.title;
+    const location = (cal.location && cal.location !== '無') ? cal.location : '';
+    const note = (cal.note && cal.note !== '無') ? cal.note : '無';
+    const description = '【LINE 全能教師管家自動建立】\n• 事項：' + title + '\n• 地點：' + (location || '無') + '\n• 備註：' + note;
+
+    if (targetTimeStr && targetTimeStr !== '待定') {
+      const parsedDate = new Date(targetTimeStr.replace(/-/g, '/'));
+      
+      if (!isNaN(parsedDate.getTime())) {
+        if (targetTimeStr.includes(':')) {
+          const endTime = new Date(parsedDate.getTime() + 60 * 60 * 1000);
+          calendar.createEvent(title, parsedDate, endTime, {
+            location: location,
+            description: description
+          });
+          return { success: true, isAllDay: false };
+        } else {
+          calendar.createAllDayEvent(title, parsedDate, {
+            location: location,
+            description: description
+          });
+          return { success: true, isAllDay: true };
+        }
+      }
+    }
+
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    calendar.createAllDayEvent('[待定] ' + title, tomorrow, {
+      location: location,
+      description: description + '\n(原始推算時間：' + targetTimeStr + ')'
+    });
+    return { success: true, isAllDay: true };
+  } catch (e) {
+    console.error('Google 日曆同步異常:', e);
+    return { success: false, error: e.toString() };
+  }
+}
+
+function createGoogleContact(ct) {
+  if (!ct || !ct.name || ct.name === '未註明') return { success: false, error: '無姓名' };
+
+  try {
+    const fullName = String(ct.name).trim();
+    let familyName = '';
+    let givenName = fullName;
+
+    if (fullName.length === 2) {
+      familyName = fullName.substring(0, 1);
+      givenName = fullName.substring(1);
+    } else if (fullName.length === 3) {
+      familyName = fullName.substring(0, 1);
+      givenName = fullName.substring(1);
+    } else if (fullName.length === 4) {
+      familyName = fullName.substring(0, 2);
+      givenName = fullName.substring(2);
+    }
+
+    const email = (ct.email && ct.email !== '無' && ct.email.includes('@')) ? ct.email.trim() : '';
+    const phone = (ct.phone && ct.phone !== '無') ? String(ct.phone).trim() : '';
+    const companyTitle = (ct.company_title && ct.company_title !== '未註明') ? ct.company_title.trim() : '';
+    const notes = (ct.notes && ct.notes !== '無') ? ct.notes.trim() : '';
+    const noteContent = '【LINE 全能智慧管家自動建立】\n• 單位/職稱：' + companyTitle + '\n• 備註：' + notes;
+
+    const personPayload = {
+      names: [
+        {
+          familyName: familyName,
+          givenName: givenName,
+          displayName: fullName
+        }
+      ]
+    };
+
+    if (phone) {
+      personPayload.phoneNumbers = [{ value: phone, type: 'mobile' }];
+    }
+
+    if (email) {
+      personPayload.emailAddresses = [{ value: email, type: 'work' }];
+    }
+
+    if (companyTitle) {
+      personPayload.organizations = [{ name: companyTitle, title: '教師/同仁/教育夥伴' }];
+    }
+
+    if (noteContent) {
+      personPayload.biographies = [{ value: noteContent, contentType: 'TEXT_PLAIN' }];
+    }
+
+    if (typeof People !== 'undefined' && People.People && People.People.createContact) {
+      const resp = People.People.createContact(personPayload);
+      console.log('[Google 聯絡人建立成功 (Advanced Service)] ' + fullName + ' (' + phone + ')');
+      return { success: true, resourceName: resp.resourceName };
+    }
+
+    const token = ScriptApp.getOAuthToken();
+    const url = 'https://people.googleapis.com/v1/people:createContact';
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'Authorization': 'Bearer ' + token },
+      payload: JSON.stringify(personPayload),
+      muteHttpExceptions: true
+    };
+
+    const response = UrlFetchApp.fetch(url, options);
+    const respCode = response.getResponseCode();
+    const respText = response.getContentText();
+
+    if (respCode === 200 || respCode === 201) {
+      const respJson = JSON.parse(respText);
+      console.log('[Google 聯絡人建立成功 (REST)] ' + fullName + ' (' + phone + ')');
+      return { success: true, resourceName: respJson.resourceName };
+    } else {
+      console.warn('[Google 聯絡人建立失敗] HTTP ' + respCode + ': ' + respText);
+      return { success: false, error: 'People API 回傳 (' + respCode + '): ' + respText };
+    }
+  } catch (e) {
+    console.error('Google 聯絡人同步異常:', e);
+    return { success: false, error: e.toString() };
+  }
+}
