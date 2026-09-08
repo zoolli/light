@@ -112,7 +112,7 @@ function reset() {
   ssStub.tabs['光明燈管理'] = sheet; ssStub.created = [];
   sheet._rows = SEED.map(r => r.slice()); sheet._wrote = 0;
   sheet._formulas = {}; sheet._cleared = 0; sheet._protected = false;
-  run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false');
+  run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false; CONFIG.SPREADSHEET_ID = "FAKE";');
   cacheStore = {}; sent = [];
   ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS; run('CONFIG.AGENT_FROM_LINE_PROFILE = false');
   ctx.__NEXT_AI = null; ctx.PROFILE_NAME = '';
@@ -639,6 +639,67 @@ t('SHEET_NAMES 拿掉兩行 -> 投影機制整個不執行', () => {
 t('SPREADSHEET_ID 沒設 -> 明確報錯', () => {
   run('CONFIG.SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"');
   assert.throws(() => run('getSpreadsheet()'), /尚未設定 SPREADSHEET_ID/);
+});
+
+
+console.log('\n【新增時遇到同廟：A 承攬商納入判斷 + B 多列先列清單】');
+const D2 = o => Object.assign({ agent: null, temple: null, spec: null, total_count: null, delivery_text: null, software: null, computer: null, remark: null }, o);
+const create = (d, txt) => run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: d })}, ${JSON.stringify(txt || '')}, "U_DUP")`);
+t('新廟名 -> 直接新增並標註第一筆', () => {
+  const r = create(D2({ agent: '聖文', temple: '順安宮', spec: '5*7 OLED', total_count: 50 }));
+  assert.ok(/新增成功/.test(r), r);
+  assert.ok(/新廟名/.test(r), r);
+});
+t('同廟但規格不同 -> 仍新增，並列出該廟既有規格', () => {
+  const r = create(D2({ agent: '聖文', temple: '金六結福德廟', spec: '7*9 OLED', total_count: 300 }));
+  assert.ok(/新增成功/.test(r), r);
+  assert.ok(/該廟既有規格：4\*5 OLED（4,472 盞）、5\*7 OLED（1,407 盞）/.test(r), r);
+});
+t('A) 同廟同規格但承攬商不同 -> 當作另一張單新增，並提示既有那筆', () => {
+  const before = sheet._rows.length;
+  const r = create(D2({ agent: '名典', temple: '石岡子乾元宮', spec: '5*7 OLED琥珀色', total_count: 300 }));
+  assert.strictEqual(sheet._rows.length, before + 1, '應寫入：' + r);
+  assert.ok(!/疑似重複登記/.test(r), r);
+  assert.ok(/第 2 列已有同規格但承攬商為「聖文」/.test(r), r);
+  assert.strictEqual(sheet._rows[sheet._rows.length - 1][0], '名典');
+});
+t('同廟同規格且同承攬商 -> 擋下並給出正確的「修改」範例（用全名）', () => {
+  const before = sheet._rows.length;
+  const r = create(D2({ agent: '趴一', temple: '天成宮(中和)', spec: '4*5 OLED', total_count: 200 }));
+  assert.strictEqual(sheet._rows.length, before, '不應寫入：' + r);
+  assert.ok(/疑似重複登記】第 17 列/.test(r), r);
+  assert.ok(/修改 天成宮\(中和\) 4\*5 OLED 總燈數變成 2500 盞/.test(r), r);
+});
+t('B) 只打「天成宮」兩館同規格 -> 不寫入、列出兩館、存補件草稿', () => {
+  const before = sheet._rows.length;
+  const r = create(D2({ agent: '聖文', temple: '天成宮', spec: '4*5 OLED', total_count: 200 }), '小幫手 天成宮 4*5 OLED 200盞');
+  assert.strictEqual(sheet._rows.length, before, '不應寫入：' + r);
+  assert.ok(/同名廟有 2 列相同規格/.test(r), r);
+  assert.ok(/第 16 列：天成宮\(北投\)/.test(r), r);
+  assert.ok(/第 17 列：天成宮\(中和\)/.test(r), r);
+  assert.ok(run('!!loadDraft("U_DUP")'), '應留下補件草稿');
+});
+t('B 之後補全名 -> 接到草稿並指向正確那一館', () => {
+  create(D2({ agent: '聖文', temple: '天成宮', spec: '4*5 OLED', total_count: 200 }), '小幫手 天成宮 4*5 OLED 200盞');
+  const draft = run('loadDraft("U_DUP")');
+  assert.ok(draft, '應有補件草稿');
+  const merged = JSON.parse(run(`JSON.stringify(mergeDetails(${JSON.stringify(draft.details)}, ${JSON.stringify(D2({ temple: '天成宮(中和)', spec: '4*5 OLED', total_count: 200 }))}))`));
+  assert.strictEqual(merged.temple, '天成宮(中和)');
+  const r = run(`handleDataRouting(${JSON.stringify({ action: 'CREATE', details: merged })}, "天成宮(中和) 4*5 200盞", "U_DUP")`);
+  // 草稿業務是預設「聖文」，既有那列是「趴一」→ 依 A 規則當作另一張單，但已指向正確的中和館
+  assert.ok(/新增成功/.test(r), r);
+  assert.ok(/第 17 列已有同規格但承攬商為「趴一」/.test(r), r);
+  assert.ok(/天成宮\(中和\)/.test(sheet._rows[sheet._rows.length - 1][1]), JSON.stringify(sheet._rows[sheet._rows.length - 1]));
+});
+t('強制新增可以繞過一切比對', () => {
+  const before = sheet._rows.length;
+  const r = create(D2({ agent: '聖文', temple: '天成宮', spec: '4*5 OLED', total_count: 200 }), '強制新增');
+  assert.strictEqual(sheet._rows.length, before + 1, r);
+  assert.ok(/新增成功/.test(r), r);
+});
+t('合計列不會被當成同廟', () => {
+  const r = create(D2({ agent: '聖文', temple: '合計燈數', spec: '4*5 OLED', total_count: 1 }));
+  assert.ok(/新廟名/.test(r), r);
 });
 
 console.log(`\n結果：${pass} 通過 / ${fail} 失敗`);

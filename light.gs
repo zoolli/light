@@ -141,7 +141,7 @@ function doPost(e) {
               sendLineReply(replyToken, askMissingMessage(miss, merged));
             } else {
               clearDraft(userId);
-              sendLineReply(replyToken, handleDataRouting({ action: 'CREATE', details: merged }, aiInput) + agentNote);
+              sendLineReply(replyToken, handleDataRouting({ action: 'CREATE', details: merged }, aiInput, userId) + agentNote);
             }
           } else if (!shouldReplyFor(act)) {
             console.log('🔇 不回覆（AI 判定意圖 ' + (act || '未知') + '，非新增/修改）：' + bodyText);
@@ -479,7 +479,9 @@ function handleHelpCommand() {
     '　　　 綁兩段時業務欄顯示「亞盛燈業-李小華」；換人或換公司再傳一次蓋掉',
     '　 👤 單筆想填別家：直接寫在句首，例：' + wake + ' 甫穎-仁武保安宮 ...',
     '　 ⏳ 收到提示後 ' + Math.round(CONFIG.DRAFT_TTL / 60) + ' 分鐘內直接補（例：' + wake + ' 規格5*7 OLED琥珀色），我會自動合併',
-    '　 ⚠️ 同廟同規格已存在會先提示；確定是第二批請加「強制新增」',
+    '　 ⚠️ 只要廟名對到既有資料，我會把那些列列出來請你確認（不會靜悄悄地亂加或亂擋）',
+    '　 ⚠️ 同廟＋同規格＋同承攬商 → 視為重複，請改用「修改」；確定是第二批請加「強制新增」',
+    '　 ⚠️ 同廟同規格但承攬商不同 → 當成另一張單，直接新增；同名廟多會館 → 會要你寫全名',
     '',
     '✏️ 2. 修改（需含「廟宇」＋「規格」才能定位）',
     '　 例：' + wake + ' 修改 新化武廟 4*5 OLED琥珀色 總燈數變成5238盞 軟體冠緯 電腦研華',
@@ -903,7 +905,7 @@ function formatRecordLine(row, prefix) {
          (cell(row, C.REMARK) ? '\n    備註：' + cell(row, C.REMARK) : '');
 }
 
-function handleDataRouting(aiResult, originalText) {
+function handleDataRouting(aiResult, originalText, userId) {
   var sheet = getLightSheet();
   if (!sheet) return "【⚠️ 系統錯誤】找不到分頁「" + CONFIG.SHEET_NAMES.LIGHT_MGMT + "」。\n處置：到 GAS 編輯器把函式選單切到 setupLightSheet → 執行一次（會自動建立分頁並寫好 A~H 表頭）。";
   if (!aiResult || !aiResult.details) return "【⚠️ 無法解析】AI 未回傳有效欄位，請換一種說法重試（輸入 /help 看範例）。";
@@ -912,40 +914,84 @@ function handleDataRouting(aiResult, originalText) {
   var action = String(aiResult.action || '').toUpperCase();
   var d = aiResult.details;
 
-  if (action === 'CREATE') return doCreate(sheet, d, originalText);
+  if (action === 'CREATE') return doCreate(sheet, d, originalText, userId);
   if (action === 'UPDATE') return doUpdate(sheet, d, originalText);
   if (action === 'READ') return doRead(sheet, d, originalText);
   return "【⚠️ 無法辨識意圖】（" + (aiResult.action || '無') + "）\n💡 輸入 /help 查看使用方式";
 }
 
 // ------------------ 1. 新增 ------------------
-function doCreate(sheet, d, originalText) {
+// 只要有碰到同廟，一律把該廟現有的列列出來給對方確認，避免「同名不同館」被亂擋或亂加
+function doCreate(sheet, d, originalText, userId) {
   var C = CONFIG.COLUMNS;
   if (!d.temple && !d.spec) {
     return "【⚠️ 新增失敗】至少要寫「廟宇」與「規格」，例：\n聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華";
   }
 
   var data = readData(sheet);
-  var dupRow = 0;
+  var sameTemple = [];   // 廟名（模糊）命中的列號
   for (var i = 1; i < data.length; i++) {
     if (isSummaryRow(data[i])) continue;
-    if (matchTemple(cell(data[i], C.TEMPLE), d.temple) && matchSpec(cell(data[i], C.SPEC), d.spec)) {
-      dupRow = i + 1; break;
-    }
+    if (d.temple && matchTemple(cell(data[i], C.TEMPLE), d.temple)) sameTemple.push(i + 1);
+  }
+  var force = /強制新增/.test(originalText || '');
+
+  // 情況一：這廟从没登記過 → 直接新增
+  if (!sameTemple.length) return appendNewRow(sheet, d, '🆕 新廟名（表上是第一筆）');
+
+  // 情況二：同廟但規格完全不同 → 視為另一種規格，照常新增並列出既有規格讓你知道
+  var exact = [];
+  sameTemple.forEach(function (r) { if (matchSpec(cell(data[r - 1], C.SPEC), d.spec)) exact.push(r); });
+  if (!force && !exact.length) {
+    return appendNewRow(sheet, d, 'ℹ️ 該廟既有規格：' + sameTemple.map(function (r) {
+      return (cell(data[r - 1], C.SPEC) || '未填') + '（' + withComma(cell(data[r - 1], C.TOTAL)) + ' 盞）';
+    }).join('、') + '｜本次是新規格，已另外加一列');
   }
 
-  // 同一廟＋同一規格預設視為同一筆，避免重複登記；加「強制新增」可覆蓋
-  if (dupRow > 0 && !/強制新增/.test(originalText || '')) {
-    var exist = data[dupRow - 1];
-    return "【⚠️ 疑似重複登記】第 " + dupRow + " 列已有同廟同規格紀錄：\n" +
-           formatRecordLine(exist, '    ') + "\n" +
-           "✏️ 若是要改數量，請改說：修改 " + (d.temple || '') + " " + (d.spec || '') + " 總燈數變成 2500 盞\n" +
-           "💡 若這真的是第二批，請在訊息尾端加上「強制新增」再送一次。";
+  // 情況三：同廟同規格命中兩列以上 → 不能猜，列清單請對方指明（同时存草稿）
+  if (!force && exact.length > 1) {
+    var optLines = exact.map(function (r) {
+      return '    · 第 ' + r + ' 列：' + (cell(data[r - 1], C.TEMPLE) || '未填') +
+             '｜' + (cell(data[r - 1], C.SPEC) || '未填規格') +
+             '｜' + (cell(data[r - 1], C.AGENT) || '未填業務') +
+             '｜' + withComma(cell(data[r - 1], C.TOTAL)) + ' 盞';
+    }).join('\n');
+    if (userId) saveDraft(userId, { raw: originalText || '', details: d });
+    return '【⚠️ 同名廟有 ' + exact.length + ' 列相同規格，先不動資料】\n' + optLines + '\n' +
+           '➡️ 請把廟名寫完整再傳一次（含分館／地址），例：\n' +
+           '    ' + (CONFIG.WAKE_WORDS[0] || '小幫手') + ' ' +
+           (cell(data[exact[0] - 1], C.AGENT) || '聖文') + '-' + (cell(data[exact[0] - 1], C.TEMPLE) || d.temple) +
+           ' ' + (d.spec || (cell(data[exact[0] - 1], C.SPEC) || '5*7 OLED')) + ' ' +
+           (d.total_count || '200') + '盞\n' +
+           '💡 這確實是要另起的一筆（例如第二批），訊息尾端加「強制新增」即可直接入表';
   }
 
+  // 情況四：正好命中一列
+  var existRow = data[exact[0] - 1];
+  var existAgent = cell(existRow, C.AGENT), newAgent = String(d.agent || '').trim();
+  var sameAgent = !newAgent || !existAgent || containsLoose(existAgent, newAgent);
+
+  if (!force && sameAgent) {
+    return '【⚠️ 疑似重複登記】第 ' + exact[0] + ' 列已有同廟同規格紀錄：\n' +
+           formatRecordLine(existRow, '    ') + '\n' +
+           '✏️ 若是要改數量，請改說：修改 ' + (cell(existRow, C.TEMPLE) || d.temple) + ' ' +
+           (cell(existRow, C.SPEC) || d.spec || '') + ' 總燈數變成 2500 盞\n' +
+           '💡 若這真的是第二批，請在訊息尾端加上「強制新增」再送一次。';
+  }
+
+  // 同廟同規格但承攬商不同 → 當成另一張單新增（同一間廟兩家共填時不會互相擋）
+  if (!force) {
+    return appendNewRow(sheet, d, '⚠️ 注意：第 ' + exact[0] + ' 列已有同規格但承攬商為「' +
+      (existAgent || '未填') + '」的紀錄，本次已以「' + (newAgent || '未填') + '」另外加一列');
+  }
+  return appendNewRow(sheet, d, '（依「強制新增」直接入表）');
+}
+
+function appendNewRow(sheet, d, note) {
   var newRow = buildRowValues(d);
   sheet.appendRow(newRow);
-  return "【🟢 新增成功】已寫入第 " + sheet.getLastRow() + " 列\n" + formatRecordLine(newRow, '');
+  var out = '【🟢 新增成功】已寫入第 ' + sheet.getLastRow() + ' 列\n' + formatRecordLine(newRow, '');
+  return note ? out + '\n' + note : out;
 }
 
 // ------------------ 2. 修改 ------------------
