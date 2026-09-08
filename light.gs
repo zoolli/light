@@ -9,8 +9,11 @@ var CONFIG = {
   // 已自動代入您提供的試算表 ID
   // SPREADSHEET_ID: '1Kq6Du15HfVJt1KiB4YGBcQH2cjQL1Z-0DufeLMiTH9A', 
   GEMINI_MODEL: PropertiesService.getScriptProperties().getProperty('GEMINI_MODEL') || 'gemini-3.6-flash',
+  // 登記資料所在的分頁名稱；想換名字就在腳本屬性新增 SHEET_NAME = 你的分頁名（不用改程式）
   SHEET_NAMES: {
-    LIGHT_MGMT: '光明燈管理'  // 請確保您的試算表分頁名稱叫做「光明燈管理」
+    LIGHT_MGMT: (function() {
+      try { return String(PropertiesService.getScriptProperties().getProperty('SHEET_NAME') || '光明燈管理').trim(); } catch (e) { return '光明燈管理'; }
+    })()
   },
 
   // 試算表欄位索引（1 起算）。業務與廟宇分開兩欄，正規日期放最右側輔助欄
@@ -36,7 +39,17 @@ var CONFIG = {
   })(),
   // 新增登記的必填欄位：缺任何一個就先請對方補，不會寫進試算表
   REQUIRED_FIELDS: ['agent', 'temple', 'spec', 'total_count'],
-  // 沒寫業務時，是否自動讀 LINE 暱稱補上。預設 OFF：暱稱常是個人綽號，會蓋掉公司名稱
+  // 業務欄解析優先序：句中寫的 > 該使用者綁定的 > 預設值(DEFAULT_AGENT) > LINE 暱稱(須另外開啟)
+  // 本系統預設由「聖文」承包，所以沒特別交代就上聖文；别家訂單請寫在句首（例：名典-○○宮）
+  // 換主力公司：腳本屬性 DEFAULT_AGENT = 別的公司名；設成空白則未寫業務又沒綁定時會回問
+  DEFAULT_AGENT: (function() {
+    try {
+      var v = PropertiesService.getScriptProperties().getProperty('DEFAULT_AGENT');
+      if (v !== null && String(v).trim() === '') return '';  // 明確設空 = 不用預設
+      return String(v || '聖文').trim();
+    } catch (e) { return '聖文'; }
+  })(),
+  // 沒寫業務、也沒有預設值時，是否退回自動讀 LINE 暱稱。預設 OFF：暱稱常是個人綽號
   // 需要時在腳本屬性新增 AGENT_FROM_LINE_PROFILE = ON 開啟
   AGENT_FROM_LINE_PROFILE: (function() {
     try { return /^(ON|YES|1|TRUE)$/i.test(String(PropertiesService.getScriptProperties().getProperty('AGENT_FROM_LINE_PROFILE') || '')); } catch (e) { return false; }
@@ -102,12 +115,16 @@ function doPost(e) {
             var merged = mergeDetails(draft ? draft.details : null, aiResult.details);
             var agentNote = '';
             if (String(merged.agent || '').trim() === '') {
-              var idt = getUserIdentity(userId);
-              if (idt.name) {
+              var idt = getUserIdentity(userId);   // 先取本人綁定的公司／人員
+              if (idt.source === 'bind' && idt.name) {
                 merged.agent = idt.name;
-                agentNote = idt.source === 'bind'
-                  ? '\n👤 業務自動帶入：' + idt.name + '（要換人/換公司：傳「我是 ○○」或「我公司 ○○ 我叫 ○○」）'
-                  : '\n👤 業務自動帶入 LINE 暱稱「' + idt.name + '」，若應填公司名稱請傳「我公司 您的公司名」修正。';
+                agentNote = '\n👤 業務自動帶入（您的綁定）：' + idt.name + '（換人/換公司：傳「我是 ○○」或「我公司 ○○ 我叫 ○○」）';
+              } else if (CONFIG.DEFAULT_AGENT) {   // 沒綁定 → 用預設承攬商
+                merged.agent = CONFIG.DEFAULT_AGENT;
+                agentNote = '\n👤 業務預設帶入：' + CONFIG.DEFAULT_AGENT + '（若是别家訂單請寫在句首，或傳「我是 ○○」綁定您的公司）';
+              } else if (idt.name) {               // 沒預設 → 才考慮 LINE 暱稱（須開 AGENT_FROM_LINE_PROFILE）
+                merged.agent = idt.name;
+                agentNote = '\n👤 業務自動帶入 LINE 暱稱「' + idt.name + '」，若應填公司名稱請傳「我公司 您的公司名」修正。';
               }
             }
             var miss = missingRequired(merged);
@@ -447,7 +464,8 @@ function handleHelpCommand() {
     '　 例：' + wake + ' 聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華',
     '　 例：' + wake + ' 我要登記，媽祖廟新增財神燈500盞，業務王小明',
     '　 ⚠️ 必填欄位缺任何一項都不會上表，我會回覆「還需要什麼」格式',
-    '　 👤 業務身分綁定一次就好（未填業務時自動帶入）：',
+    '　 👤 業務預設＝' + (CONFIG.DEFAULT_AGENT || '（未設定，會回問）') + '；沒特別寫就上這個名字',
+    '　 👤 想固定用自己公司名：綁定一次即可蓋掉預設（' + wake + ' 我是聖文）：',
     '　　　 例：' + wake + ' 我是聖文　／　' + wake + ' 我公司 亞盛燈業 我叫 李小華',
     '　　　 綁兩段時業務欄顯示「亞盛燈業-李小華」；換人或換公司再傳一次蓋掉',
     '　 👤 單筆想填別家：直接寫在句首，例：' + wake + ' 甫穎-仁武保安宮 ...',
@@ -617,9 +635,22 @@ function analyzeMessageWithGemini(text) {
 }
 
 // ==================== 4. 核心業務邏輯：新增、修改、查詢 ====================
-function getLightSheet() {
-  var ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  return ss.getSheetByName(CONFIG.SHEET_NAMES.LIGHT_MGMT);
+function getSpreadsheet() {
+  if (!CONFIG.SPREADSHEET_ID || CONFIG.SPREADSHEET_ID === 'YOUR_SPREADSHEET_ID') {
+    throw new Error('尚未設定 SPREADSHEET_ID（GAS 專案設定 → 腳本屬性）');
+  }
+  return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+}
+
+// createIfMissing=true 時會自動建立分頁（供 setupLightSheet 使用）
+function getLightSheet(createIfMissing) {
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.SHEET_NAMES.LIGHT_MGMT);
+  if (!sheet && createIfMissing) {
+    sheet = ss.insertSheet(CONFIG.SHEET_NAMES.LIGHT_MGMT);
+    Logger.log('🆕 已建立分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」');
+  }
+  return sheet;
 }
 
 function sheetTimeZone() {
@@ -648,9 +679,24 @@ function ensureColumnWidth(sheet) {
 }
 
 // 於 GAS 編輯器手動執行一次：補齊欄位並寫入表頭
+// 【上線執行這一支就好】分頁不存在就自動建立，並寫入 A~H 表頭、補齊欄位
+// 重複執行安全：已有資料不會被清掉，只把第 1 列表頭蓋成同一組名稱
+function setupLightSheet() {
+  var sheet = getLightSheet(true);
+  ensureColumnWidth(sheet);
+  sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setValues([CONFIG.HEADERS]);
+  sheet.setFrozenRows(1);
+  try { sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setFontWeight('bold'); } catch (e) {}
+  var msg = '✅ 分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」就緒（欄位 A~' +
+            String.fromCharCode(64 + CONFIG.COLUMNS.DATE_KEY) + '）：' + CONFIG.HEADERS.join(' | ');
+  Logger.log(msg);
+  return msg;
+}
+
+// 只寫表頭、不建立分頁（分頁已存在時用）
 function setupLightHeader() {
   var sheet = getLightSheet();
-  if (!sheet) throw new Error('找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」');
+  if (!sheet) throw new Error('找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」，請改執行 setupLightSheet()');
   ensureColumnWidth(sheet);
   sheet.getRange(1, 1, 1, CONFIG.HEADERS.length).setValues([CONFIG.HEADERS]);
   Logger.log('✅ 表頭已寫入：' + CONFIG.HEADERS.join(' | '));
@@ -773,7 +819,7 @@ function formatRecordLine(row, prefix) {
 
 function handleDataRouting(aiResult, originalText) {
   var sheet = getLightSheet();
-  if (!sheet) return "系統錯誤：找不到名為「" + CONFIG.SHEET_NAMES.LIGHT_MGMT + "」的工作表分頁，請先在試算表中建立此分頁。";
+  if (!sheet) return "【⚠️ 系統錯誤】找不到分頁「" + CONFIG.SHEET_NAMES.LIGHT_MGMT + "」。\n處置：到 GAS 編輯器把函式選單切到 setupLightSheet → 執行一次（會自動建立分頁並寫好 A~H 表頭）。";
   if (!aiResult || !aiResult.details) return "【⚠️ 無法解析】AI 未回傳有效欄位，請換一種說法重試（輸入 /help 看範例）。";
 
   ensureColumnWidth(sheet);
@@ -906,7 +952,7 @@ function doUpdate(sheet, d, originalText) {
 function renameAgent(fromName, toName, dryRun) {
   var C = CONFIG.COLUMNS;
   var sheet = getLightSheet();
-  if (!sheet) return '找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」';
+  if (!sheet) return '找不到分頁「' + CONFIG.SHEET_NAMES.LIGHT_MGMT + '」，請先執行 setupLightSheet()';
   if (!fromName || !toName) return '請輸入兩個名稱：renameAgent("舊名", "新名")';
 
   var data = readData(sheet), rows = [], preview = [];

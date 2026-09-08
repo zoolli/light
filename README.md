@@ -4,7 +4,7 @@
 經辦人在 LINE 用**自然語言**登記燈位，AI 解析後寫進 Google 試算表；查詢與大量修改直接用瀏覽器開試算表。
 
 - 程式碼：`light.gs`（單檔，無相依套件）
-- 測試：`test/light.test.js`（純 Node 跑的 stub 測試，不需 GAS 環境）→ `node test/light.test.js`，目前 78 項全過
+- 測試：`test/light.test.js`（純 Node 跑的 stub 測試，不需 GAS 環境）→ `node test/light.test.js`，目前 83 項全過
 
 ---
 
@@ -123,7 +123,18 @@ sendLineReply() → 手機收到「新增成功／修改成功／需要補件」
 | `小幫手 我叫 李小華` | `李小華` |
 | `小幫手 業務窗口 冠緯` | `冠緯` |
 
-- 換人／換公司：再傳一次會蓋掉；單筆想填別家，直接寫在句首（`甫穎-○○宮 …`）
+**A 欄（業務）的取值優先序** —— 本系統預設由「聖文」承攬，所以沒特別交代就上聖文：
+
+| 優先序 | 來源 | 回覆會顯示 |
+|---|---|---|
+| 1 | 句中寫的（`名典-○○宮 …`） | 不帶入提示，直接用你寫的 |
+| 2 | 該 LINE 使用者綁定的公司／人員 | `👤 業務自動帶入（您的綁定）：名典-李小華` |
+| 3 | `DEFAULT_AGENT`（預設 `聖文`） | `👤 業務預設帶入：聖文（若是别家訂單請寫在句首…）` |
+| 4 | LINE 暱稱（需 `AGENT_FROM_LINE_PROFILE=ON` 且 3 設空） | `👤 業務自動帶入 LINE 暱稱「…」` |
+| － | 上述全無 | 不回問？會 → `還需要：業務／公司名` |
+
+- 換人／換公司：再傳一次會蓋掉；單筆想填別家，直接寫在句首（`名典-○○宮 …`）
+- 整組訂單都是别家承包：把腳本屬性 `DEFAULT_AGENT` 改成那家名稱即可，不用改程式
 - **預設不會**拿 LINE 暱稱寫進業務欄（暱稱常是個人綽號，會弄髒公司名）。需要時在腳本屬性加 `AGENT_FROM_LINE_PROFILE = ON`
 
 ### 3.3 指令規格
@@ -140,7 +151,8 @@ sendLineReply() → 手機收到「新增成功／修改成功／需要補件」
 | 位置 | 預設 | 說明 |
 |---|---|---|
 | `CONFIG.WAKE_WORDS` | `小幫手, 小帮, 幫手, 助理` | 腳本屬性 `WAKE_WORDS`（逗號分隔）可蓋，免改程式 |
-| `CONFIG.REQUIRED_FIELDS` | `agent, temple, spec, total_count` | 必填欄位 |
+| `CONFIG.REQUIRED_FIELDS` | `agent, temple, spec, total_count` | 必填欄位（agent 會由優先序自動補齊） |
+| `CONFIG.DEFAULT_AGENT` | `聖文` | 業務欄的預設承攬商，腳本屬性可蓋 |
 | `CONFIG.DRAFT_TTL` | `600` 秒 | 補件草稿保留；CacheService 上限 600 |
 | `CONFIG.MAX_LIST_ROWS` | `12` | 查詢／提示最多列出筆數 |
 | `CONFIG.COLUMNS` | A~H | 欄位索引對應表，改表結構只動這裡 |
@@ -167,6 +179,8 @@ sendLineReply() → 手機收到「新增成功／修改成功／需要補件」
 | `SPREADSHEET_ID` | 試算表網址 `/d/` 與 `/edit` 之間那串 | 建議必填，詳見 4.3 |
 | `GEMINI_MODEL` | 例 `gemini-3.1-flash-lite` | 選填，等同 `/model xxx` |
 | `WAKE_WORDS` | 例 `小幫手,助理` | 選填 |
+| `SHEET_NAME` | 資料分頁名稱，預設 `光明燈管理` | 選填（分頁由 `setupLightSheet()` 自動建立） |
+| `DEFAULT_AGENT` | 沒寫業務、也沒綁定時的預設承攬商，預設 `聖文`；設空白＝改用綁定／LINE 暱稱，都沒有就回問 | 選填 |
 | `REPLY_MODE` | `ALL` 時查詢與閒聊也會回訊 | 選填 |
 | `AGENT_FROM_LINE_PROFILE` | `ON` 時未填業務自動帶 LINE 暱稱 | 選填 |
 
@@ -208,9 +222,9 @@ ID 怎麼看：試算表網址 `https://docs.google.com/spreadsheets/d/←這一
 
 ### 4.5 上線後第一件事
 ```
-小幫手 我是聖文                                  ← 每人綁一次
-小幫手 聖文-石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前 軟體其他 電腦研華
+小幫手 石岡子乾元宮 5*7 OLED琥珀色 2112盞 國10/17前   ← 沒寫業務就上預設「聖文」
 小幫手 修改 新化武廟 4*5 OLED琥珀色 總燈數變成5300盞
+小幫手 我是 名典                                    ← 只有别家的人／窗口要綁一次
 ```
 
 ---
@@ -241,6 +255,7 @@ prompt 內的四條硬規則（要加欄位時一起改）：
 |---|---|---|
 | 訊息完全沒回 | 沒帶喚醒字、或那是查詢句（設計如此） | 執行記錄會印 `🔇 不回覆（…）`；要全部回覆就設 `REPLY_MODE=ALL` |
 | LINE Verify 失敗 | 沒發新版本、網址少 `/exec`、權限不是「任何人」 | 重走 4.4 |
+| `找不到分頁「光明燈管理」` | 分頁還沒建立或名稱不對 | GAS 執行一次 `setupLightSheet()`（會自動建分頁），或用腳本屬性 `SHEET_NAME` 指定現有分頁名 |
 | 只有「系統異常」 | 試算表分頁名不對、`SPREADSHEET_ID` 錯、該表不在你帳號下 | 看執行記錄堆疊；`找不到名為「光明燈管理」的工作表分頁` = ID 對但分頁名錯；`openById` 權限錯誤 = 表不屬於你 |
 | 登記寫到舊表 | 拿到的是 light.gs:7 的 fallback ID（腳本屬性沒設、又不是綁定型腳本） | 設 `SPREADSHEET_ID` 或把 fallback 那段刪掉 |
 | `AI 免費配額暫時用盡` | Gemini 免費層限流 | `小幫手` 不用管，稍後重試；或 `/model gemini-3.1-flash-lite` |
@@ -256,7 +271,7 @@ prompt 內的四條硬規則（要加欄位時一起改）：
 ```bash
 node test/light.test.js
 ```
-用 Node 的 `vm` 载入 `light.gs`，把 `SpreadsheetApp`／`UrlFetchApp`／`CacheService` 等 GAS 服務换成 stub，並塞入真實格式的 17 列種子資料（含合計列、右側公式欄）。涵蓋：
+用 Node 的 `vm` 载入 `light.gs`，把 `SpreadsheetApp`／`UrlFetchApp`／`CacheService` 等 GAS 服務换成 stub，並塞入真實格式的 17 列種子資料（含合計列、右側公式欄）。涵蓋（共 83 項）：
 
 - 日期正規化 12 種寫法
 - 小計列跳過、規格／廟名正規化比對
@@ -265,6 +280,8 @@ node test/light.test.js
 - 查詢：筆數與合計盞數、無條件時只列最新且不含合計
 - 回覆策略：喚醒字、查詢／閒聊沉默、`REPLY_MODE=ALL`
 - 端到端 `doPost`：缺欄追問 → 10 分鐘內補件合併 → 寫入
+- 業務欄優先序（句中 > 綁定 > `DEFAULT_AGENT` > 暱稱）
+- 分頁自動建立 `setupLightSheet()`、`SPREADSHEET_ID` 佔位值防護
 - 身分綁定各種寫法、批次改名 `renameAgent()` 預覽與實作
 
 改動 `light.gs` 後請先跑这支再部署。

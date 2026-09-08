@@ -23,6 +23,7 @@ const SEED = [
   ['合計燈數', '', '', 104487, '', '', '', '']
 ];
 
+let sheetExists = true;
 function makeSheet(rows) {
   const s = {
     _rows: rows.map(r => r.slice()),
@@ -31,11 +32,11 @@ function makeSheet(rows) {
     getMaxColumns() { return s._rows.reduce((a, r) => Math.max(a, r.length), 0); },
     getLastRow() { return s._rows.length; },
     appendRow(v) { s._rows.push(v.slice()); s._wrote++; },
-    insertColumnsAfter() {},
+    insertColumnsAfter() {}, setFrozenRows() {},
     getRange(r, c, nr, nc) {
       nr = nr || 1; nc = nc || 1;
       return {
-        setValue(v) {
+        setFontWeight() { return this; }, setValue(v) {
           while (s._rows.length < r) s._rows.push([]);
           const row = s._rows[r - 1];
           while (row.length < c) row.push('');
@@ -57,7 +58,10 @@ function load() {
     PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperty: (k, v) => props[k] = v, deleteProperty: k => delete props[k] }) },
     SpreadsheetApp: {
       getActiveSpreadsheet: () => ({ getId: () => 'FAKE' }),
-      openById: () => ({ getSheetByName: n => (n === '光明燈管理' ? sheet : null) })
+      openById: () => ({
+        getSheetByName: n => (n === '光明燈管理' && sheetExists ? sheet : null),
+        insertSheet: n => { sheetExists = true; sheet._rows = [HEADER.slice()]; return sheet; }
+      })
     },
     Session: { getScriptTimeZone: () => 'Asia/Taipei' },
     __props: props,
@@ -86,7 +90,9 @@ const ctx = load();
 const run = expr => vm.runInContext(expr, ctx);
 let pass = 0, fail = 0;
 function reset() {
+  sheetExists = true;
   sheet._rows = SEED.map(r => r.slice()); sheet._wrote = 0;
+  run('CONFIG.DEFAULT_AGENT = "聖文"; CONFIG.AGENT_FROM_LINE_PROFILE = false');
   cacheStore = {}; sent = [];
   ctx.__props.REPLY_MODE = ''; delete ctx.__props.USER_IDENTS; run('CONFIG.AGENT_FROM_LINE_PROFILE = false');
   ctx.__NEXT_AI = null; ctx.PROFILE_NAME = '';
@@ -371,16 +377,31 @@ t('（同一測試的前段重複檢查）缺總燈數 -> 不寫表', () => {
   assert.strictEqual(sheet._rows.length, before, '不應寫入試算表');
 });
 
-t('預設不取 LINE 暱稱（避免公司欄被個人綽號蓋掉）', () => {
+t('沒寫業務 -> 上預設承攬商「聖文」，不會卡也問不到暱稱', () => {
   ctx.PROFILE_NAME = '小明🔥';
   ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
   post('小幫手 登記 武勝宮 5*7 OLED 200盞');
+  assert.ok(/業務預設帶入：聖文/.test(sent[0]), sent[0]);
+  assert.strictEqual(sheet._rows[sheet._rows.length - 1][0], '聖文');
+});
+t('綁定優先於預設（聖文員工不會被寫成別家）', () => {
+  post('小幫手 我公司 名典 我叫 李小華');
+  sent.length = 0;
+  ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
+  post('小幫手 登記 武勝宮 5*7 OLED 200盞');
+  assert.ok(/業務自動帶入（您的綁定）：名典-李小華/.test(sent[0]), sent[0]);
+  assert.strictEqual(sheet._rows[sheet._rows.length - 1][0], '名典-李小華');
+});
+t('DEFAULT_AGENT 設空 -> 沒綁定也沒寫業務時才回問', () => {
+  run('CONFIG.DEFAULT_AGENT = ""');
+  ctx.PROFILE_NAME = '小明🔥';
+  ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
+  post('小幫手 登記 武勝宮 5*7 OLED 200盞', 'U_NO_BIND_2');
   assert.ok(/還需要：業務／公司名/.test(sent[0]), sent[0]);
-  assert.ok(/我是 聖文/.test(sent[0]), sent[0]);
   assert.strictEqual(sheet._rows.length, 18, '不應寫入任何一列');
 });
-t('開 AGENT_FROM_LINE_PROFILE=ON 才自動帶暱稱並告知可修正', () => {
-  run('CONFIG.AGENT_FROM_LINE_PROFILE = true');
+t('開 AGENT_FROM_LINE_PROFILE=ON 且無預設 -> 才自動帶 LINE 暱稱', () => {
+  run('CONFIG.AGENT_FROM_LINE_PROFILE = true; CONFIG.DEFAULT_AGENT = ""');
   ctx.PROFILE_NAME = '小明🔥';
   ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
   post('小幫手 登記 武勝宮 5*7 OLED 200盞');
@@ -396,7 +417,7 @@ t('「我是王大仁」綁定姓名，之後優先套用綁定名', () => {
   sent.length = 0;
   ai({ action: 'CREATE', details: D({ temple: '保安宮', spec: '4*5 OLED', total_count: 300 }) });
   post('小幫手 登記 保安宮 4*5 OLED 300盞');
-  assert.ok(/業務自動帶入：王大仁/.test(sent[0]), sent[0]);
+  assert.ok(/業務自動帶入（您的綁定）：王大仁/.test(sent[0]), sent[0]);
   assert.strictEqual(sheet._rows[sheet._rows.length - 1][0], '王大仁');
 });
 t('「我是OO」開頭的整串登記不會被當成綁定', () => {
@@ -405,7 +426,8 @@ t('「我是OO」開頭的整串登記不會被當成綁定', () => {
   assert.ok(!/已記住您的業務身分/.test(sent[0] || ''), sent[0]);
   assert.ok(/新增成功/.test(sent[0]), sent[0]);
 });
-t('未綁定且拿不到 LINE 姓名 -> 請補業務／公司名', () => {
+t('全部拿不到（無預設、無綁定、無暱稱）-> 請補業務／公司名', () => {
+  run('CONFIG.DEFAULT_AGENT = ""');
   ctx.PROFILE_NAME = '';
   ai({ action: 'CREATE', details: D({ temple: '廣正宮', spec: '5*7 OLED', total_count: 100 }) });
   post('小幫手 登記 廣正宮 5*7 OLED 100盞', 'U_NO_NAME');
@@ -429,7 +451,7 @@ t('綁公司+人員 -> 業務欄顯示「公司-人員」', () => {
   sent.length = 0;
   ai({ action: 'CREATE', details: D({ temple: '保安宮', spec: '4*5 OLED', total_count: 120 }) });
   post('小幫手 登記 保安宮 4*5 OLED 120盞');
-  assert.ok(/業務自動帶入：亞盛燈業-李小華/.test(sent[0]), sent[0]);
+  assert.ok(/業務自動帶入（您的綁定）：亞盛燈業-李小華/.test(sent[0]), sent[0]);
   assert.strictEqual(sheet._rows[sheet._rows.length - 1][0], '亞盛燈業-李小華');
 });
 t('綁定後改公司名 -> 直接蓋掉舊名', () => {
@@ -486,6 +508,25 @@ t('業務相符 + 指明分館 -> 只改那一列', () => {
   assert.ok(/修改成功/.test(sent[0]), sent[0]);
   assert.strictEqual(sheet._rows[15][3], 118);
   assert.strictEqual(sheet._rows[16][3], 108, '中和館不應被改');
+});
+
+console.log('\n【分頁自動建立與提示】');
+t('分頁不存在 -> 錯誤訊息導向 setupLightSheet()', () => {
+  sheetExists = false;
+  ai({ action: 'CREATE', details: D({ temple: '武勝宮', spec: '5*7 OLED', total_count: 200 }) });
+  post('小幫手 登記 武勝宮 5*7 OLED 200盞');
+  assert.ok(/setupLightSheet/.test(sent[0]), sent[0]);
+});
+t('setupLightSheet() 自動建立分頁並寫 A~H 表頭', () => {
+  sheetExists = false;
+  const msg = run('setupLightSheet()');
+  assert.ok(/就緒/.test(msg), msg);
+  assert.strictEqual(sheetExists, true, 'insertSheet 應被呼叫');
+  assert.deepStrictEqual(sheet._rows[0], HEADER);
+});
+t('SPREADSHEET_ID 沒設 -> 明確報錯', () => {
+  run('CONFIG.SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"');
+  assert.throws(() => run('getSpreadsheet()'), /尚未設定 SPREADSHEET_ID/);
 });
 
 console.log(`\n結果：${pass} 通過 / ${fail} 失敗`);
